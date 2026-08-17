@@ -1,0 +1,90 @@
+name: Release Linux-64
+
+# 一键发布 Linux amd64：Linux 原生编译 → 打 tag → 创建 GitHub Release → 上传 zip + dgst。
+# 触发：Actions 页面 Run workflow，输入 tag（如 v1.0.10）与发布说明。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v1.0.10 (will be created if missing)'
+        required: true
+      body:
+        description: 'Release notes (optional)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux-64:
+    runs-on: ubuntu-latest
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: 0
+      GOPRIVATE: github.com/csdfsdffese/*
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.0'
+
+      - name: Get project dependencies
+        run: |
+          go mod download
+
+      - name: Build ljfxznode
+        run: |
+          version="${{ github.event.inputs.tag }}"
+          echo "version: $version"
+          mkdir -p build_assets
+          go build -v -o build_assets/ljfxznode -trimpath -ldflags "-X 'github.com/csdfsdffese/ljfxznode/cmd.version=$version' -s -w -buildid="
+
+      - name: Prepare assets
+        run: |
+          cp ${GITHUB_WORKSPACE}/README.md ./build_assets/README.md
+          cp ${GITHUB_WORKSPACE}/LICENSE ./build_assets/LICENSE
+          cp ${GITHUB_WORKSPACE}/example/*.json ./build_assets/
+          for i in geoip geosite
+          do
+            DOWNLOAD_URL="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/${i}.dat"
+            echo -e "Downloading ${DOWNLOAD_URL}..."
+            curl -L "${DOWNLOAD_URL}" -o ./build_assets/${i}.dat
+          done
+
+      - name: Create ZIP archive and digest
+        shell: bash
+        run: |
+          pushd build_assets || exit 1
+          touch -mt $(date +%Y01010000) *
+          zip -9vr ../ljfxznode-linux-64.zip .
+          popd || exit 1
+          FILE=./ljfxznode-linux-64.zip
+          DGST=$FILE.dgst
+          for METHOD in {"md5","sha1","sha256","sha512"}
+          do
+            openssl dgst -$METHOD $FILE | sed 's/([^)]*)//g' >>$DGST
+          done
+
+      - name: Create tag and push
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git tag "${{ github.event.inputs.tag }}"
+          git push origin "${{ github.event.inputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          body: ${{ github.event.inputs.body }}
+          files: |
+            ljfxznode-linux-64.zip
+            ljfxznode-linux-64.zip.dgst
