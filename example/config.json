@@ -1,0 +1,56 @@
+{
+  "Log": {
+    "Level": "info",
+    "Output": ""
+  },
+  "Cores": [
+    {
+      "Type": "xray",
+      "Log": {
+        "Level": "info",
+        "AccessPath": "",
+        "ErrorPath": ""
+      },
+      "AssetPath": "/etc/ljfxznode/",
+      "DnsConfigPath": "/etc/ljfxznode/dns.json",
+      "RouteConfigPath": "/etc/ljfxznode/route.json",
+      "InboundConfigPath": "/etc/ljfxznode/custom_inbound.json",
+      "OutboundConfigPath": "/etc/ljfxznode/custom_outbound.json"
+    }
+  ],
+  "Nodes": [
+    {
+      "Core": "xray",
+      "ApiHost": "http://127.0.0.1",
+      "ApiKey": "test",
+      "NodeID": 33,
+      "NodeType": "shadowsocks",
+      "Timeout": 30,
+      "ListenIP": "0.0.0.0",
+      "SendIP": "0.0.0.0",
+      "DeviceOnlineMinTraffic": 200,
+      "MinReportTraffic": 0,
+      "XrayOptions": {
+        "EnableProxyProtocol": false,
+        "EnableDNS": false,
+        "DNSType": "AsIs",
+        "EnableUot": false,
+        "EnableTFO": false,
+        "DisableIVCheck": false,
+        "DisableSniffing": false,
+        "EnableFallback": false
+      },
+      "CertConfig": {
+        "CertMode": "self",
+        "RejectUnknownSni": false,
+        "CertDomain": "example.com",
+        "CertFile": "/etc/ljfxznode/fullchain.cer",
+        "KeyFile": "/etc/ljfxznode/cert.key",
+        "Provider": "cloudflare",
+        "DNSEnv": {
+          "EnvName": "env1"
+        }
+      }
+    }
+  ]
+}
