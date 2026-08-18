@@ -31,6 +31,37 @@ const refShards = 256
 var limitLock sync.RWMutex
 var limiter map[string]*Limiter
 
+// kickLocal 由 dispatcher 注册：断开本进程内指定用户（taguuid）指定 IP 的所有连接。
+// 剔除动作不依赖 WS，任何时刻都可用。
+var kickLocal atomic.Pointer[func(taguuid string, ip string)]
+
+// kickReporter 由 node.Controller 注册：通过 WS 向面板上报剔除请求，
+// 由面板转发给该 IP 在线的其他节点，实现跨节点剔除。
+var kickReporter atomic.Pointer[func(uid int, taguuid string, ip string)]
+
+// RegisterKickLocal 注册本地断连执行器（dispatcher 在初始化时调用）。
+func RegisterKickLocal(fn func(taguuid string, ip string)) {
+	if fn != nil {
+		kickLocal.Store(&fn)
+	}
+}
+
+// RegisterKickReporter 注册跨节点剔除上报执行器（node.Controller 调用）。
+func RegisterKickReporter(fn func(uid int, taguuid string, ip string)) {
+	if fn != nil {
+		kickReporter.Store(&fn)
+	}
+}
+
+// KickLocal 断开本进程内指定用户（taguuid）指定 IP 的所有连接。
+// 供 controller 处理面板 sync.kick 事件时调用，与满员剔除（kickDevice）
+// 共用 dispatcher 注册的同一断链执行器。
+func KickLocal(taguuid string, ip string) {
+	if fn := kickLocal.Load(); fn != nil {
+		(*fn)(taguuid, ip)
+	}
+}
+
 func Init() {
 	limiter = map[string]*Limiter{}
 }
@@ -69,10 +100,21 @@ type Limiter struct {
 	// 不同用户并行建连互不阻塞（替代旧版的全局 openGateMu 串行化）。
 	gateLocks [gateShards]sync.Mutex
 
+	// kickThrottle 记录各分片最近一次剔除时间（纳秒），下标与 gateLocks 一致，
+	// 在对应 gateLock 持有下读写（同分片互斥，无 data race）。
+	// 超限风暴时合并剔除频率：每分片每秒至多触发一次随机剔除，
+	// 避免并发新连接各自踢一个 victim 造成「剔除风暴」同时断开多个
+	// 在线用户（一次剔除腾出的名额远比单个新连接大，节流不损收敛速度）。
+	kickThrottle [gateShards]int64
+
 	// globalDevices 是面板 WS 推送的全局设备表（uid → 在线 IP 集合），
 	// 跨所有节点去重，用于全局限数判断；由 globalLock 保护。
+	// globalCount 是同一快照的 per-uid 去重 IP 数（UpdateGlobalDevices 时
+	// 一次性算出），供 checkDeviceGate 的 O(1) 快速上/下界判断，避免每个
+	// 新连接都遍历全局表。
 	globalLock       sync.RWMutex
 	globalDevices    map[int]map[string]bool
+	globalCount      map[int]int
 	globalLastUpdate time.Time
 }
 
@@ -96,6 +138,7 @@ func AddLimiter(tag string, l *conf.LimitConfig, users []panel.UserInfo, aliveLi
 		SpeedLimiter:  new(sync.Map),
 		AliveList:     aliveCopy,
 		globalDevices: make(map[int]map[string]bool),
+		globalCount:   make(map[int]int),
 	}
 	for i := range info.refShards {
 		info.refShards[i].m = make(map[int]map[string]int)
@@ -175,6 +218,7 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 		sh.mu.Unlock()
 		l.globalLock.Lock()
 		delete(l.globalDevices, deleted[i].Id)
+		delete(l.globalCount, deleted[i].Id)
 		l.globalLock.Unlock()
 		l.deviceDirty.Store(true)
 	}
@@ -235,13 +279,14 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noSSUDP bool) (Bucket *r
 		// 仅 TCP 连接计数（对齐官方 Xboard-Node：UDP 会话只裁决、不占用设备数）。
 		// 裁决 + 计数原子化（TryOpenConn），避免并发新连接同时通过门禁导致超限；
 		// 连接关闭时由 dispatcher 回调 ConnClosed 递减。
-		if !l.TryOpenConn(uid, ip, deviceLimit) {
+		// 满员时 TryOpenConn 会拒绝并随机剔除一个已在线 IP（断其连接）腾位。
+		if !l.TryOpenConn(uid, taguuid, ip, deviceLimit) {
 			return nil, true
 		}
 	} else if deviceLimit > 0 {
-		// UDP：只裁决不计数（只读无副作用、无竞态）。checkDeviceGate 内部
-		// 优先全局表（WS sync.devices），过期时回退本地 + alivelist 兜底。
-		if l.checkDeviceGate(uid, ip, deviceLimit) {
+		// UDP：只裁决不计数、不触发剔除（只读无副作用、无竞态）。
+		// checkDeviceGate 内部优先全局表（WS sync.devices），过期时回退本地 + alivelist 兜底。
+		if reject, _ := l.checkDeviceGate(uid, ip, deviceLimit); reject {
 			return nil, true
 		}
 	}
@@ -292,6 +337,13 @@ func (l *Limiter) UpdateGlobalDevices(users map[int][]string) {
 	}
 	l.globalLock.Lock()
 	l.globalDevices = devices
+	// 同步缓存 per-uid 去重 IP 数：供 checkDeviceGate 快速上/下界判断。
+	// 与 globalDevices 同一快照、同一锁，保证二者永远一致。
+	globalCount := make(map[int]int, len(devices))
+	for uid, m := range devices {
+		globalCount[uid] = len(m)
+	}
+	l.globalCount = globalCount
 	l.globalLastUpdate = time.Now()
 	l.globalLock.Unlock()
 }
@@ -326,8 +378,12 @@ func (l *Limiter) ResetDevicesDirty() { l.deviceDirty.Store(false) }
 // 无限制用户（deviceLimit<=0）走快速路径直接计数，不占用任何门禁锁；
 // 有限制用户以 uid 分片锁保证「同用户裁决+计数」原子（不同用户并行），
 // 避免并发新连接在彼此计数前同时通过裁决而超出 deviceLimit。
+// 满员时（新 IP 且在线设备数已到上限）拒绝连接，并异步随机剔除一个
+// 已在线 IP（断开其所有连接），为后续新设备腾出接入名额。
 // 返回 false 表示被门禁拒绝（不计数）；true 表示放行并已计数。
-func (l *Limiter) TryOpenConn(uid int, ip string, deviceLimit int) bool {
+// taguuid 为 format.UserTag(tag, uuid)，与 Xray user.Email 及 LinkManagers 的 key 一致，
+// 剔除回调据此在 dispatcher 中定位该用户的连接表。
+func (l *Limiter) TryOpenConn(uid int, taguuid string, ip string, deviceLimit int) bool {
 	ip = strings.TrimPrefix(ip, "::ffff:")
 	if deviceLimit <= 0 {
 		l.ConnOpened(uid, ip)
@@ -336,11 +392,37 @@ func (l *Limiter) TryOpenConn(uid int, ip string, deviceLimit int) bool {
 	lk := l.gateLock(uid)
 	lk.Lock()
 	defer lk.Unlock()
-	if l.checkDeviceGate(uid, ip, deviceLimit) {
+	reject, victim := l.checkDeviceGate(uid, ip, deviceLimit)
+	if reject {
+		if victim != "" {
+			// 剔除节流：同分片每秒至多剔除一次（gateLock 持有时读写，原子）。
+			// 超限风暴时多个新连接并发被拒，若各自踢一个 victim 会同时断开
+			// 多个在线用户；一次剔除已能断开 victim 的全部连接腾出大量名额，
+			// 节流合并后收敛速度不变、误伤面显著减小。
+			shard := uint(uid) & (gateShards - 1)
+			if now := time.Now().UnixNano(); now-l.kickThrottle[shard] > int64(time.Second) {
+				l.kickThrottle[shard] = now
+				// 异步剔除：不阻塞当前连接路径。victim 选择基于已拷贝的
+				// local/global 快照，goroutine 内不再读共享状态。
+				go l.kickDevice(uid, taguuid, victim)
+			}
+		}
 		return false
 	}
 	l.ConnOpened(uid, ip)
 	return true
+}
+
+// kickDevice 执行剔除动作：本地断开 victim 的所有连接（dispatcher 回调），
+// 并向面板上报剔除请求（controller 回调），由面板转发给该 IP 在线的
+// 其他节点完成跨节点剔除。两者任一未注册则静默跳过对应环节。
+func (l *Limiter) kickDevice(uid int, taguuid string, ip string) {
+	if fn := kickLocal.Load(); fn != nil {
+		(*fn)(taguuid, ip)
+	}
+	if fn := kickReporter.Load(); fn != nil {
+		(*fn)(uid, taguuid, ip)
+	}
 }
 
 // gateLock 返回 uid 对应的分片锁（取模 2 的幂，位运算取余）。
@@ -386,19 +468,23 @@ func (l *Limiter) ConnClosed(taguuid string, ip string) {
 	l.deviceDirty.Store(true)
 }
 
-// checkDeviceGate 判断新连接（新 IP）是否应被拒绝。
-// 对齐官方 Xboard-Node conntracker：全局设备表新鲜时一律 merge 全量裁决；
-// 全局表过期/缺失时才走本地判断，并以 REST alivelist 兜底（断线补偿）。
-// 全程无 map 分配：以线性扫描统计替代旧版的 merged 合并 + 字典序排序。
-func (l *Limiter) checkDeviceGate(uid int, ip string, limit int) bool {
+// checkDeviceGate 判断新连接（新 IP）是否应被拒绝，并在拒绝时选出被剔除的
+// 已在线 IP（victim，空串表示无需剔除）。
+// 策略为「绝对上限」：以 local∪global 纯 IP 去重后的设备数为准，
+// 达到 deviceLimit 即拒绝一切新 IP（不同于官方的字典序排序淘汰）。
+// 全局设备表新鲜时（WS 正常）以全局数据为准；过期/缺失时回退本地判断，
+// 并以 REST alivelist 兜底（断线补偿）。
+// 被拒绝的新 IP 不占用任何名额；victim 断开后在线数回落，后续新设备可接入。
+func (l *Limiter) checkDeviceGate(uid int, ip string, limit int) (reject bool, victim string) {
 	if limit <= 0 {
-		return false
+		return false, ""
 	}
 	l.globalLock.RLock()
 	stale := time.Since(l.globalLastUpdate) > globalDevicesStaleAfter
-	// globalIPs 引用由 UpdateGlobalDevices 整体替换、从不原地修改，
+	// globalIPs/globalCount 引用由 UpdateGlobalDevices 整体替换、从不原地修改，
 	// 释放锁后仍可安全遍历（持有的始终是不可变的旧表）。
 	globalIPs := l.globalDevices[uid]
+	globalCount := l.globalCount[uid]
 	l.globalLock.RUnlock()
 
 	sh := &l.refShards[uint(uid)&(refShards-1)]
@@ -407,64 +493,74 @@ func (l *Limiter) checkDeviceGate(uid int, ip string, limit int) bool {
 	// 本节点已有该 IP 的活跃连接 → 同 IP 复连，放行
 	if local[ip] > 0 {
 		sh.mu.RUnlock()
-		return false
+		return false, ""
 	}
 	if !stale {
 		// 全局表新鲜：一律以 WS 数据为准（官方主路径），即使该用户无全局条目
 		// 或面板刚推过空表也不回退 alivelist，避免与 REST 旧计数互相矛盾。
 		if globalIPs[ip] {
 			sh.mu.RUnlock()
-			return false // 其他节点已知该 IP → 视为同一设备，放行
+			return false, "" // 其他节点已知该 IP → 视为同一设备，放行
 		}
-		// merge 本节点 + 全局后全量裁决：拒绝 ⟺ 两表并集（去重）中字典序
-		// 小于 ip 的条目数 ≥ limit（等价于官方排序后 ip 不在前 limit 位）。
-		reject := countLessThan(local, globalIPs, ip, limit)
+		// 上界快速拒绝：union ≥ |local| 且 union ≥ |global|，任一达到 limit
+		// 即必然超限，免于遍历全局表（满员高并发热点路径）。
+		if len(local) >= limit || globalCount >= limit {
+			victim := pickVictim(local, globalIPs)
+			sh.mu.RUnlock()
+			return true, victim
+		}
+		// 下界快速放行：union ≤ |local| + |global|（并集最大为两集合大小之和），
+		// 之和仍小于 limit 则必然未满，免于遍历全局表（低水位常见路径）。
+		if len(local)+globalCount < limit {
+			sh.mu.RUnlock()
+			return false, ""
+		}
+		// 中间区间：精确计算并集（去重）设备数
+		count := len(local)
+		if globalIPs != nil {
+			for gip := range globalIPs {
+				if _, dup := local[gip]; !dup {
+					count++
+				}
+			}
+		}
+		// victim 必须在持有 local 读锁时选出（遍历共享 map）
+		var victim string
+		if count >= limit {
+			victim = pickVictim(local, globalIPs)
+		}
 		sh.mu.RUnlock()
-		return reject
+		return count >= limit, victim
 	}
 	// 全局表过期或缺失（WS 断线中）：本地判断；未满时以 alivelist 兜底
 	// （面板 REST 全局数据）。alivelist 仅有计数无 IP 明细，无法判断新 IP
 	// 是否已在其他节点在线，此处保守拒绝（断线补偿的固有代价）。
 	if len(local) < limit {
+		victim = pickVictim(local, nil)
 		sh.mu.RUnlock()
 		if alive := l.GetAliveCount(uid); alive >= limit {
-			return true
+			// alivelist 显示已满：拒绝，并尽力剔除一个本地 IP 腾位
+			return true, victim
 		}
-		return false
+		return false, ""
 	}
-	reject := countLessThan(local, nil, ip, limit)
+	victim = pickVictim(local, nil)
 	sh.mu.RUnlock()
-	return reject
+	return true, victim
 }
 
-// countLessThan 统计 local∪global（去重）中字典序小于 ip 的条目数是否 ≥ limit。
-// local 为 refShards 分片值类型（map[string]int，连接数），global 为设备集合（map[string]bool）；
-// 无分配：先扫 local，再扫 global 并跳过 local 中已计过的键，达到 limit 提前停止。
-// 调用方须持有对应 refShard 的读锁以保证 local 稳定。
-func countLessThan(local map[string]int, global map[string]bool, ip string, limit int) bool {
-	less := 0
-	for k := range local {
-		if k < ip {
-			less++
-			if less >= limit {
-				return true
-			}
-		}
+// pickVictim 从在线集合中随机选一个待剔除 IP：优先本节点本地在线的
+// （断开立即可见、可控），否则从全局表选（由面板协调其他节点断开）。
+// Go map 遍历顺序随机，天然实现「随机剔除」。返回空串表示无候选。
+// 调用方须已持有相应 refShard 读锁（local 稳定）或持有不可变全局表引用。
+func pickVictim(local map[string]int, global map[string]bool) string {
+	for ip := range local {
+		return ip
 	}
-	for k := range global {
-		if k < ip {
-			// 显式存在性去重：local 中已计过的键（无论连接数）不再重复计数。
-			// 不用 local[k]==0 判断，避免未来计数归零残留键时双重计数导致误拒。
-			if _, dup := local[k]; dup {
-				continue
-			}
-			less++
-			if less >= limit {
-				return true
-			}
-		}
+	for ip := range global {
+		return ip
 	}
-	return false
+	return ""
 }
 
 // determineSpeedLimit returns the minimum non-zero rate

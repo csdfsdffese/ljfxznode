@@ -10,6 +10,8 @@ import (
 type ManagedWriter struct {
 	writer  buf.Writer
 	manager *LinkManager
+	// ip 是产生该连接的来源 IP（剔除时按 IP 匹配断开）。
+	ip string
 }
 
 func (w *ManagedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -51,4 +53,32 @@ func (m *LinkManager) CloseAll() {
 		common.Close(w)
 		common.Interrupt(r)
 	}
+}
+
+// CloseByIP 关闭指定来源 IP 的所有连接（含 TCP 与 UDP 会话），
+// 返回被关闭的连接数。IP 为空或没有匹配连接时不执行任何操作。
+// 采用与 CloseAll 相同的「快照后锁外关闭」模式，避免死锁。
+func (m *LinkManager) CloseByIP(ip string) int {
+	if ip == "" {
+		return 0
+	}
+	m.mu.Lock()
+	matched := make([]struct {
+		w *ManagedWriter
+		r buf.Reader
+	}, 0, 4)
+	for w, r := range m.links {
+		if w.ip == ip {
+			matched = append(matched, struct {
+				w *ManagedWriter
+				r buf.Reader
+			}{w, r})
+		}
+	}
+	m.mu.Unlock()
+	for _, e := range matched {
+		common.Close(e.w)
+		common.Interrupt(e.r)
+	}
+	return len(matched)
 }

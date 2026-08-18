@@ -22,6 +22,8 @@ const (
 	WSEventReportDevices  = "report.devices"  // 节点 → 面板：上报本地设备
 	WSEventRequestDevices = "request.devices" // 节点 → 面板：主动请求全局设备状态
 	WSEventSyncUserDelta  = "sync.user.delta" // 面板 → 节点：用户变更（流量超限移除等）
+	WSEventSyncKick       = "sync.kick"       // 面板 → 节点：剔除某用户某 IP 的所有连接（其他节点转发）
+	WSEventReportKick     = "report.kick"     // 节点 → 面板：上报剔除请求，由面板转发给该 IP 在线的其他节点
 )
 
 // wsMessage 是所有 WS 消息的 JSON 信封。
@@ -39,6 +41,14 @@ type syncDevicesPayload struct {
 	NodeID    int              `json:"node_id"`
 }
 
+// kickPayload 是剔除请求的统一载荷（report.kick / sync.kick 共用）。
+// user_id 供面板定位用户、按 IP 转发给其他节点；email/ip 供接收节点断开连接。
+type kickPayload struct {
+	UserID int    `json:"user_id"`
+	Email  string `json:"email"`
+	IP     string `json:"ip"`
+}
+
 // WSClient 连接面板的 Workerman WebSocket 服务。
 // 认证在 WS 握手时通过 query 参数（token + node_id）完成，无需单独鉴权步骤。
 // 断线后由 Run 负责指数退避重连；设备状态在断线期间保留旧数据，
@@ -50,6 +60,8 @@ type WSClient struct {
 	onDevice      func(users map[int][]string)
 	onStatus      func(connected bool)
 	onRemoveUsers func(userIDs []int)
+	onAddUsers    func(users []UserInfo)
+	onKick        func(email string, ip string)
 
 	connected atomic.Bool
 	// writeChMu 保护 writeCh：connect（Run goroutine）赋值/置 nil，
@@ -61,7 +73,10 @@ type WSClient struct {
 // NewWSClient 创建 WS 客户端。
 // wsURL 为面板返回的 ws(s):// 地址；token/nodeID 复用 REST 凭据。
 // onRemoveUsers 接收面板 sync.user.delta 的移除用户 ID 列表（流量超限主动通知）。
-func NewWSClient(wsURL, token string, nodeID int, onDevice func(map[int][]string), onStatus func(bool), onRemoveUsers func([]int)) *WSClient {
+// onAddUsers 接收面板 sync.user.delta 的新增/恢复用户（用户新增或套餐变更），
+// 使新用户秒级生效，无需等待下一轮 REST 轮询。
+// onKick 接收面板 sync.kick 的剔除请求（email+ip）：本节点断开该用户该 IP 的全部连接。
+func NewWSClient(wsURL, token string, nodeID int, onDevice func(map[int][]string), onStatus func(bool), onRemoveUsers func([]int), onAddUsers func([]UserInfo), onKick func(email string, ip string)) *WSClient {
 	return &WSClient{
 		wsURL:         wsURL,
 		token:         token,
@@ -69,6 +84,8 @@ func NewWSClient(wsURL, token string, nodeID int, onDevice func(map[int][]string
 		onDevice:      onDevice,
 		onStatus:      onStatus,
 		onRemoveUsers: onRemoveUsers,
+		onAddUsers:    onAddUsers,
+		onKick:        onKick,
 	}
 }
 
@@ -243,27 +260,48 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 			w.onDevice(users)
 		}
 	case WSEventSyncUserDelta:
+		// 面板 payload: {action: "add"|"remove", users:[{id, uuid, speed_limit, device_limit}]}
+		// add 为新增/恢复用户，remove 为流量超限/禁用移除。字段与 UserInfo 对齐，
+		// 直接复用结构体解码，新增用户即可携带限速/限设备数，无需二次 REST 拉取。
 		var payload struct {
-			Action string `json:"action"`
-			Users  []struct {
-				Id int `json:"id"`
-			} `json:"users"`
+			Action string     `json:"action"`
+			Users  []UserInfo `json:"users"`
 		}
 		if err := json.Unmarshal(msg.Data, &payload); err != nil {
 			log.WithField("err", err).Warn("ws: decode sync.user.delta failed")
 			return
 		}
-		if payload.Action != "remove" || w.onRemoveUsers == nil {
-			return
-		}
-		ids := make([]int, 0, len(payload.Users))
-		for _, u := range payload.Users {
-			if u.Id > 0 {
-				ids = append(ids, u.Id)
+		switch payload.Action {
+		case "add":
+			if w.onAddUsers != nil && len(payload.Users) > 0 {
+				w.onAddUsers(payload.Users)
+			}
+		case "remove":
+			if w.onRemoveUsers == nil {
+				return
+			}
+			ids := make([]int, 0, len(payload.Users))
+			for _, u := range payload.Users {
+				if u.Id > 0 {
+					ids = append(ids, u.Id)
+				}
+			}
+			if len(ids) > 0 {
+				w.onRemoveUsers(ids)
 			}
 		}
-		if len(ids) > 0 {
-			w.onRemoveUsers(ids)
+	case WSEventSyncKick:
+		// 面板转发其他节点的剔除请求：本节点断开该用户该 IP 的全部连接。
+		var payload struct {
+			Email string `json:"email"`
+			IP    string `json:"ip"`
+		}
+		if err := json.Unmarshal(msg.Data, &payload); err != nil {
+			log.WithField("err", err).Warn("ws: decode sync.kick failed")
+			return
+		}
+		if w.onKick != nil && payload.IP != "" {
+			w.onKick(payload.Email, payload.IP)
 		}
 	case "ping":
 		// pong 由读循环回写
@@ -335,6 +373,38 @@ func (w *WSClient) SendDeviceReport(devices map[int][]string) bool {
 		return true
 	default:
 		log.Warn("ws write channel full, skipping device report")
+		return false
+	}
+}
+
+// SendKickReport 通过 WS 上报剔除请求：本节点设备满员时选定 victim IP，
+// 上报面板由面板转发给该 IP 在线的其他节点，完成跨节点剔除。
+// 未连接或写队列满时返回 false（剔除动作仅影响其他节点，本地已由
+// dispatcher 直接断开，未上报可接受，不强重试）。
+func (w *WSClient) SendKickReport(uid int, email string, ip string) bool {
+	if !w.connected.Load() {
+		return false
+	}
+	data, err := json.Marshal(kickPayload{UserID: uid, Email: email, IP: ip})
+	if err != nil {
+		return false
+	}
+	msg := wsMessage{
+		Event:     WSEventReportKick,
+		Data:      data,
+		Timestamp: time.Now().Unix(),
+	}
+	w.writeChMu.Lock()
+	ch := w.writeCh
+	w.writeChMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- msg:
+		return true
+	default:
+		log.Warn("ws write channel full, skipping kick report")
 		return false
 	}
 }

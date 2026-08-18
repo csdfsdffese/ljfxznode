@@ -131,7 +131,30 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.router = router
 	d.policy = pm
 	d.stats = sm
+	// 注册限数剔除回调：设备满员时 limiter 随机选出 victim IP，本节点直接断开
+	// 该 IP 的全部连接（通过 LinkManagers 按 email+ip 匹配）。全局单例注册，
+	// 多实例场景后注册覆盖先注册（行为等价，可接受）。
+	limiter.RegisterKickLocal(func(email string, ip string) {
+		d.KickByUserIP(email, ip)
+	})
 	return nil
+}
+
+// KickByUserIP 断开指定用户（email）从指定来源 IP 发起的所有连接。
+// 由 limiter 剔除回调触发：新设备超限接入时随机选一个在线 IP 作为 victim，
+// 关闭其全部本地连接（TCP 与 UDP），为该用户腾出设备接入名额。
+// 关闭会触发连接级 refcount 递减（routedDispatch 的 defer ConnClosed），
+// 设备快照随之更新，面板计数回落。
+func (d *DefaultDispatcher) KickByUserIP(email string, ip string) {
+	if ip == "" {
+		return
+	}
+	if v, ok := d.LinkManagers.Load(email); ok {
+		n := v.(*LinkManager).CloseByIP(ip)
+		if n > 0 {
+			errors.LogInfo(context.Background(), "kick device: user ", email, " ip ", ip, " closed ", n, " conn(s)")
+		}
+	}
 }
 
 // Type implements common.HasType.
@@ -206,6 +229,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 		managedWriter := &ManagedWriter{
 			writer:  uplinkWriter,
 			manager: lm,
+			ip:      sessionInbound.Source.Address.IP().String(),
 		}
 		lm.AddLink(managedWriter, outboundLink.Reader)
 		inboundLink.Writer = managedWriter
@@ -381,6 +405,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		managedWriter := &ManagedWriter{
 			writer:  outbound.Writer,
 			manager: lm,
+			ip:      sessionInbound.Source.Address.IP().String(),
 		}
 		outbound.Writer = managedWriter
 		if w != nil {

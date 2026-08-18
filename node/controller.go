@@ -208,7 +208,21 @@ func (c *Controller) startWS() {
 		func(userIDs []int) {
 			c.removeUsersByIDs(userIDs)
 		},
+		// sync.user.delta add：新用户/恢复用户秒级生效，不等下一轮 REST 轮询。
+		func(users []panel.UserInfo) {
+			c.addUsersByWS(users)
+		},
+		// 面板转发其他节点的剔除请求：断开本节点该用户该 IP 的全部连接。
+		func(email string, ip string) {
+			limiter.KickLocal(email, ip)
+		},
 	)
+	// 注册跨节点剔除上报：设备满员随机剔除 victim 时，向面板上报，
+	// 由面板转发给该 IP 在线的其他节点完成跨节点剔除（本地断链已由
+	// dispatcher 的 kickLocal 回调直接完成）。
+	limiter.RegisterKickReporter(func(uid int, email string, ip string) {
+		c.wsClient.SendKickReport(uid, email, ip)
+	})
 	log.WithField("tag", c.tag).Infof("Panel WebSocket enabled, connecting %s", hs.WebSocket.WSURL)
 	go c.wsClient.Run(ctx)
 	// 周期上报本地设备快照：面板聚合后回推 sync.devices（10s 级收敛）。
@@ -338,6 +352,68 @@ func (c *Controller) removeUsersByIDs(ids []int) {
 	c.limiter.UpdateUser(c.tag, nil, deleted, nil)
 	c.stateMu.RUnlock()
 	log.WithField("tag", tag).Infof("Removed %d exceeded users by sync.user.delta", len(deleted))
+}
+
+// addUsersByWS 处理面板 sync.user.delta（add）：用户新增/恢复时秒级生效，
+// 不等下一轮 REST 轮询。与 nodeInfoMonitor 的 REST 增量路径等价的本地执行：
+// 跳过已存在用户（防 WS 重复推送 / REST 已同步）→ Xray 添加 → limiter 更新
+// → 合并进 userList，避免下轮 REST 对比将同一用户重复判定为 added。
+func (c *Controller) addUsersByWS(users []panel.UserInfo) {
+	if len(users) == 0 {
+		return
+	}
+	// 过滤：跳过无 uuid（Xray user 依赖 uuid）与已在 userList 中的用户。
+	c.userListMu.Lock()
+	existing := make(map[int]struct{}, len(c.userList))
+	for _, u := range c.userList {
+		existing[u.Id] = struct{}{}
+	}
+	fresh := make([]panel.UserInfo, 0, len(users))
+	for _, u := range users {
+		if u.Uuid == "" {
+			continue
+		}
+		if _, ok := existing[u.Id]; !ok {
+			fresh = append(fresh, u)
+		}
+	}
+	// COW 追加：在副本上合并后整体替换引用，绝不原地 append。
+	// nodeInfoMonitor 的 AddUsers / 日志对 c.userList 为无锁裸读（重操作不宜持锁），
+	// 原地 append 会并发写底层数组与其构成 data race；COW 后裸读方始终拿到
+	// 某个一致的旧/新列表（底层数组永不被写），仅可能在极端时序下略滞后一帧，
+	// 下一轮 REST compare 会自然收敛，无正确性影响。
+	if len(fresh) > 0 {
+		merged := make([]panel.UserInfo, 0, len(c.userList)+len(fresh))
+		merged = append(merged, c.userList...)
+		merged = append(merged, fresh...)
+		c.userList = merged
+	}
+	c.userListMu.Unlock()
+	if len(fresh) == 0 {
+		return
+	}
+	c.stateMu.RLock()
+	info := c.info
+	tag := c.tag
+	c.stateMu.RUnlock()
+	if info == nil {
+		return
+	}
+	if _, err := c.server.AddUsers(&vCore.AddUsersParams{
+		Tag:      tag,
+		NodeInfo: info,
+		Users:    fresh,
+	}); err != nil {
+		log.WithFields(log.Fields{
+			"tag": tag,
+			"err": err,
+		}).Warn("add users by sync.user.delta failed")
+		return
+	}
+	c.stateMu.RLock()
+	c.limiter.UpdateUser(tag, fresh, nil, nil)
+	c.stateMu.RUnlock()
+	log.WithField("tag", tag).Infof("Added %d users by sync.user.delta", len(fresh))
 }
 
 // devicesHash 计算设备快照的确定性哈希（uid+ip 排序拼接后 sha256）。
