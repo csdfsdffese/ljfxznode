@@ -9,7 +9,7 @@ require (
 	github.com/go-resty/resty/v2 v2.16.5
 	github.com/gorilla/websocket v1.5.3
 	github.com/juju/ratelimit v1.0.2
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.10.0
 	github.com/spf13/cobra v1.9.1
 	github.com/xtls/xray-core v0.0.0-20260728075948-5ca6f4b7d4dc
 	golang.org/x/crypto v0.54.0
