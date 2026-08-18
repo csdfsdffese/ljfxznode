@@ -71,15 +71,23 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		return nil
 	}
 	// get user alive
-	newA, err := c.apiClient.GetUserAlive()
-	if err != nil {
-		// alivelist 失败只降级跳过 alive 更新（保留旧表），不阻塞本轮
-		// 用户列表同步——否则用户增删改会被 alivelist 故障拖住一整轮。
-		log.WithFields(log.Fields{
-			"tag": c.tag,
-			"err": err,
-		}).Warn("Get alive list failed, keep old alive list")
-		newA = nil
+	// WS 正常时全局设备表由 sync.devices 实时驱动，alivelist 仅作断线兜底。
+	// 跳过拉取以省面板负载（alivelist 接口逐用户 hgetall + DB 查询）；
+	// WS 未启用/未连接时才轮询，断线兜底语义不变。
+	var newA map[int]int
+	if c.wsClient == nil || !c.wsClient.IsConnected() {
+		newA, err = c.apiClient.GetUserAlive()
+		if err != nil {
+			// alivelist 失败只降级跳过 alive 更新（保留旧表），不阻塞本轮
+			// 用户列表同步——否则用户增删改会被 alivelist 故障拖住一整轮。
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": err,
+			}).Warn("Get alive list failed, keep old alive list")
+			newA = nil
+		}
+	} else {
+		log.WithField("tag", c.tag).Debug("WS connected, skip alivelist polling")
 	}
 	if newN != nil {
 		c.stateMu.Lock()
@@ -121,7 +129,15 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				if userData == nil {
 					userData = c.userList
 				}
-				l := limiter.AddLimiter(c.tag, &c.LimitConfig, userData, newA)
+				// WS 正常时跳过 alivelist 拉取导致 newA 为 nil：从旧 limiter 继承
+				// alive 表，避免重建后的新 limiter 以空表启动（断线兜底失效）。
+				aliveData := newA
+				if aliveData == nil {
+					c.stateMu.RLock()
+					aliveData = c.limiter.GetAliveList()
+					c.stateMu.RUnlock()
+				}
+				l := limiter.AddLimiter(c.tag, &c.LimitConfig, userData, aliveData)
 				c.stateMu.Lock()
 				c.limiter = l
 				c.stateMu.Unlock()

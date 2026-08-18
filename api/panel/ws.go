@@ -140,6 +140,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 	defer conn.Close()
 	conn.SetReadLimit(10 << 20) // 10MB 最大消息
 
+	// 面板 AUTH_TIMEOUT 为 10s（超时主动断连），首帧读取加 20s 读超时兜底，
+	// 避免面板不响应时 connect 永久阻塞。
+	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	// 首帧应为 auth.success 或 error；个别面板可能直接推送数据事件
 	var first wsMessage
 	if err := conn.ReadJSON(&first); err != nil {
@@ -180,6 +183,10 @@ func (w *WSClient) connect(ctx context.Context) error {
 	go func() {
 		defer close(done)
 		for {
+			// 面板对节点的心跳 ping 间隔为 55s；超过 2 分钟无任何下行消息
+			// 即判定连接已死（半开连接/面板进程挂起），主动断开交由 Run 重连，
+			// 避免 connected 长期虚真、设备上报无效堆积。
+			conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 			var msg wsMessage
 			if err := conn.ReadJSON(&msg); err != nil {
 				select {
@@ -300,11 +307,12 @@ func decodeSyncDevices(raw json.RawMessage) (map[int][]string, error) {
 	return out, nil
 }
 
-// SendDeviceReport 通过 WS 上报本地设备快照（userID → IP 列表）。
+// SendDeviceReport 通过 WS 上报设备快照（userID → IP 列表）。
+// 允许空表：调用方用于「设备归零」时清空面板端本节点记录（面板按差集清除）。
 // 未连接或写队列满时返回 false（调用方应保留 hash 并在下一轮重试，
 // 避免该次设备变化因队列丢弃而永久丢失）。
 func (w *WSClient) SendDeviceReport(devices map[int][]string) bool {
-	if !w.connected.Load() || len(devices) == 0 {
+	if !w.connected.Load() {
 		return false
 	}
 	data, err := json.Marshal(devices)

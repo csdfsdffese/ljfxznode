@@ -16,14 +16,18 @@ import (
 )
 
 func (c *Controller) renewCertTask() error {
+	// tag 可能被 nodeInfoMonitor（tag 变化）重建，读取持 stateMu 避免 data race。
+	c.stateMu.RLock()
+	tag := c.tag
+	c.stateMu.RUnlock()
 	l, err := NewLego(c.CertConfig)
 	if err != nil {
-		log.WithField("tag", c.tag).Info("new lego error: ", err)
+		log.WithField("tag", tag).Info("new lego error: ", err)
 		return nil
 	}
 	err = l.RenewCert()
 	if err != nil {
-		log.WithField("tag", c.tag).Info("renew cert error: ", err)
+		log.WithField("tag", tag).Info("renew cert error: ", err)
 		return nil
 	}
 	return nil

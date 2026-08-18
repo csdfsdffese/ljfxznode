@@ -167,6 +167,11 @@ func (c *Controller) reportStatusTask() error {
 // WS 用于下行全局设备表（sync.devices）实时更新全局限数；
 // 面板未启用 WS 或探测失败时静默回退到 alivelist 轮询（不影响节点可用性）。
 func (c *Controller) startWS() {
+	// 防御：startWS 若被重复调用（例如未来加入面板 WS 地址变更后的重建），
+	// 先取消旧连接的 context，避免旧 WS goroutine 永久挂起、连接叠加泄漏。
+	if c.wsCancel != nil {
+		c.wsCancel()
+	}
 	hs, err := c.apiClient.Handshake()
 	if err != nil {
 		log.WithFields(log.Fields{"tag": c.tag, "err": err}).
@@ -226,13 +231,44 @@ func (c *Controller) reportDevicesTask() error {
 	if c.wsClient == nil || !c.wsClient.IsConnected() {
 		return nil
 	}
+
+	c.deviceReportMu.Lock()
+	prevHash := c.lastReportDevicesHash
+	c.deviceReportMu.Unlock()
+
+	// 无连接变化（设备快照未更新）且已有成功上报基线时跳过，
+	// 省去每 10s 的全量快照遍历与 sha256 计算（万级设备下的 CPU 节省）。
+	// prevHash==""（从未上报或 WS 重连清空后）时无条件执行，保证强制重发。
+	// c.limiter 指针可能被 nodeInfoMonitor 重建（tag 变化）整体替换，
+	// 所有字段访问须持 stateMu，避免 data race。
+	c.stateMu.RLock()
+	dirty := c.limiter.DevicesDirty()
+	c.stateMu.RUnlock()
+	if !dirty && prevHash != "" {
+		return nil
+	}
+
 	c.stateMu.RLock()
 	devices := c.limiter.LocalDeviceSnapshot()
 	c.stateMu.RUnlock()
+
 	if len(devices) == 0 {
-		c.deviceReportMu.Lock()
-		c.lastReportDevicesHash = ""
-		c.deviceReportMu.Unlock()
+		// 设备从有到无：补发一次空报告，让面板清除本节点设备记录。
+		// 否则面板保留断线前的旧记录直到 TTL(300s) 过期，期间全局设备表
+		// 虚高，其他节点会误判设备数已满而拒绝新连接，面板 online_count 也残留。
+		// 补发失败（队列满）不重置 hash 与脏标记，下一轮继续重试，保证最终清空；
+		// 成功或无需补发（从未上报）则复位脏标记，避免空表轮询空转。
+		if prevHash != "" && !c.wsClient.SendDeviceReport(make(map[int][]string)) {
+			return nil
+		}
+		if prevHash != "" {
+			c.deviceReportMu.Lock()
+			c.lastReportDevicesHash = ""
+			c.deviceReportMu.Unlock()
+		}
+		c.stateMu.RLock()
+		c.limiter.ResetDevicesDirty()
+		c.stateMu.RUnlock()
 		return nil
 	}
 	hash := devicesHash(devices)
@@ -240,6 +276,10 @@ func (c *Controller) reportDevicesTask() error {
 	changed := hash != c.lastReportDevicesHash
 	c.deviceReportMu.Unlock()
 	if !changed {
+		// 快照有变化但归一化集合不变（如连接开闭交替）：已评估，复位脏标记。
+		c.stateMu.RLock()
+		c.limiter.ResetDevicesDirty()
+		c.stateMu.RUnlock()
 		return nil
 	}
 	if !c.wsClient.SendDeviceReport(devices) {
@@ -248,6 +288,9 @@ func (c *Controller) reportDevicesTask() error {
 	c.deviceReportMu.Lock()
 	c.lastReportDevicesHash = hash
 	c.deviceReportMu.Unlock()
+	c.stateMu.RLock()
+	c.limiter.ResetDevicesDirty()
+	c.stateMu.RUnlock()
 	return nil
 }
 
@@ -279,13 +322,14 @@ func (c *Controller) removeUsersByIDs(ids []int) {
 	}
 	c.stateMu.RLock()
 	info := c.info
+	tag := c.tag
 	c.stateMu.RUnlock()
 	if info == nil {
 		return
 	}
-	if err := c.server.DelUsers(deleted, c.tag, info); err != nil {
+	if err := c.server.DelUsers(deleted, tag, info); err != nil {
 		log.WithFields(log.Fields{
-			"tag": c.tag,
+			"tag": tag,
 			"err": err,
 		}).Warn("remove exceeded users failed")
 		return
@@ -293,7 +337,7 @@ func (c *Controller) removeUsersByIDs(ids []int) {
 	c.stateMu.RLock()
 	c.limiter.UpdateUser(c.tag, nil, deleted, nil)
 	c.stateMu.RUnlock()
-	log.WithField("tag", c.tag).Infof("Removed %d exceeded users by sync.user.delta", len(deleted))
+	log.WithField("tag", tag).Infof("Removed %d exceeded users by sync.user.delta", len(deleted))
 }
 
 // devicesHash 计算设备快照的确定性哈希（uid+ip 排序拼接后 sha256）。
