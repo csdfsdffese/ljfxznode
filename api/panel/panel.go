@@ -26,7 +26,6 @@ type Client struct {
 	nodeEtag         string
 	userEtag         string
 	responseBodyHash string
-	AliveMap         *AliveMap
 }
 
 func New(c *conf.ApiConfig) (*Client, error) {
@@ -79,6 +78,5 @@ func New(c *conf.ApiConfig) (*Client, error) {
 		Key:       c.Key,
 		NodeType:  c.NodeType,
 		NodeId:    c.NodeID,
-		AliveMap:  &AliveMap{},
 	}, nil
 }

@@ -195,12 +195,12 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 			return nil, nil, nil, errors.New("Limited ", user.Email, " by conn or ip")
 		}
 		var lm *LinkManager
-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
-				links: make(map[*ManagedWriter]buf.Reader),
-			}
-			d.LinkManagers.Store(user.Email, lm)
-		} else {
+		// LoadOrStore 避免两个并发连接同时 Load 失败后各自 Store 相互覆盖，
+		// 导致后建 LinkManager 覆盖先建者、先连接泄漏且删除不到。
+		lm = &LinkManager{
+			links: make(map[*ManagedWriter]buf.Reader),
+		}
+		if lmloaded, ok := d.LinkManagers.LoadOrStore(user.Email, lm); ok {
 			lm = lmloaded.(*LinkManager)
 		}
 		managedWriter := &ManagedWriter{
@@ -214,11 +214,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, w)
 			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, w)
 		}
-		var t *counter.TrafficCounter
-		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
-		} else {
+		t := counter.NewTrafficCounter()
+		if c, ok := d.Counter.LoadOrStore(sessionInbound.Tag, t); ok {
 			t = c.(*counter.TrafficCounter)
 		}
 
@@ -374,12 +371,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			return errors.New("Limited ", user.Email, " by conn or ip")
 		}
 		var lm *LinkManager
-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
-				links: make(map[*ManagedWriter]buf.Reader),
-			}
-			d.LinkManagers.Store(user.Email, lm)
-		} else {
+		// LoadOrStore 避免并发连接同时 Load 失败后各自 Store 相互覆盖（同 getLink）
+		lm = &LinkManager{
+			links: make(map[*ManagedWriter]buf.Reader),
+		}
+		if lmloaded, ok := d.LinkManagers.LoadOrStore(user.Email, lm); ok {
 			lm = lmloaded.(*LinkManager)
 		}
 		managedWriter := &ManagedWriter{
@@ -391,11 +387,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			sessionInbound.CanSpliceCopy = 3
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
 		}
-		var t *counter.TrafficCounter
-		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
-			t = counter.NewTrafficCounter()
-			d.Counter.Store(sessionInbound.Tag, t)
-		} else {
+		t := counter.NewTrafficCounter()
+		if c, ok := d.Counter.LoadOrStore(sessionInbound.Tag, t); ok {
 			t = c.(*counter.TrafficCounter)
 		}
 

@@ -14,8 +14,9 @@ type CounterReader struct {
 	Counter *atomic.Int64
 }
 
-func (c *CounterReader) ReadMultiBufferTimeout(time.Duration) (buf.MultiBuffer, error) {
-	mb, err := c.Reader.ReadMultiBufferTimeout(time.Second)
+func (c *CounterReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
+	// 透传调用方的 timeout，不再硬编码 1s（否则链路超时设置被忽略）
+	mb, err := c.Reader.ReadMultiBufferTimeout(timeout)
 	if err != nil {
 		return nil, err
 	}

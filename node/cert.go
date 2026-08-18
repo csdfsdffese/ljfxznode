@@ -72,7 +72,10 @@ func (c *Controller) requestCert() error {
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
 	tmpl := &x509.Certificate{
 		Version:      3,
 		SerialNumber: big.NewInt(time.Now().Unix()),
@@ -90,7 +93,7 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(certPath, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(certPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
@@ -98,17 +101,21 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 		Type:  "CERTIFICATE",
 		Bytes: cert,
 	})
+	f.Close()
 	if err != nil {
 		return err
 	}
-	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_RDWR, 0644)
+	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
+	// key 为 RSA，PEM 标签必须写 "RSA PRIVATE KEY"（原 "EC PRIVATE KEY" 是错的，
+	// 某些客户端按标签解析会失败）。
 	err = pem.Encode(f, &pem.Block{
-		Type:  "EC PRIVATE KEY",
+		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	})
+	f.Close()
 	if err != nil {
 		return err
 	}

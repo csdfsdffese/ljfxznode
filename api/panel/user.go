@@ -50,25 +50,32 @@ func (c *Client) GetUserList() ([]UserInfo, error) {
 
 // GetUserAlive will fetch the alive_ip count for users
 func (c *Client) GetUserAlive() (map[int]int, error) {
-	c.AliveMap = &AliveMap{}
+	// 使用局部变量而非 Client 字段：任务超时后可能重叠执行，
+	// 字段会被并发 goroutine 互相覆盖，局部变量无此问题。
+	aliveMap := &AliveMap{}
 	const path = "/api/v1/server/UniProxy/alivelist"
 	r, err := c.client.R().
 		ForceContentType("application/json").
 		Get(path)
-	if err != nil || r == nil || r.StatusCode() >= 399 {
-		// an empty alive list is fine for the caller; failures only mean the
-		// device-limit check falls back to the node's own online tracking
-		c.AliveMap.Alive = make(map[int]int)
-		return c.AliveMap.Alive, nil
+	if err != nil {
+		// 返回错误而非空表：调用方（nodeInfoMonitor）会保留上一轮的 alivelist，
+		// 避免接口抖动时用空表清空全局限数兜底数据。
+		return nil, err
+	}
+	if r == nil {
+		return nil, fmt.Errorf("get alive list failed: received nil response")
+	}
+	if r.StatusCode() >= 399 {
+		return nil, fmt.Errorf("get alive list failed, status: %d", r.StatusCode())
 	}
 	if r.RawResponse != nil {
 		defer r.RawResponse.Body.Close()
 	}
-	if err := json.Unmarshal(r.Body(), c.AliveMap); err != nil {
-		c.AliveMap.Alive = make(map[int]int)
+	if err := json.Unmarshal(r.Body(), aliveMap); err != nil {
+		return nil, fmt.Errorf("unmarshal alive list failed: %s", err)
 	}
 
-	return c.AliveMap.Alive, nil
+	return aliveMap.Alive, nil
 }
 
 type UserTraffic struct {

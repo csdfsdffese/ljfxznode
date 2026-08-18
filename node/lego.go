@@ -111,10 +111,15 @@ func (l *Lego) RenewCert() error {
 	if err != nil {
 		return fmt.Errorf("read cert file error: %s", err)
 	}
-	if e, err := l.CheckCert(file); !e {
-		return nil
-	} else if err != nil {
+	// 先判错误再判是否需要续期：原 !e 先 return 使 err 分支不可达，
+	// 证书解析失败会被误当作「无需续期」。
+	expired, err := l.CheckCert(file)
+	if err != nil {
 		return fmt.Errorf("check cert error: %s", err)
+	}
+	if !expired {
+		// 距到期超过 30 天，无需续期
+		return nil
 	}
 	res, err := l.client.Certificate.Renew(certificate.Resource{
 		Domain:      l.config.CertDomain,
@@ -259,6 +264,9 @@ func (u *User) Save(path string) error {
 
 func (u *User) DecodePrivate(pemEncodedPriv string) (*ecdsa.PrivateKey, error) {
 	blockPriv, _ := pem.Decode([]byte(pemEncodedPriv))
+	if blockPriv == nil {
+		return nil, fmt.Errorf("decode private key failed: invalid PEM block")
+	}
 	x509EncodedPriv := blockPriv.Bytes
 	privateKey, err := x509.ParseECPrivateKey(x509EncodedPriv)
 	return privateKey, err

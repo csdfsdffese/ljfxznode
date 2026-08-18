@@ -31,6 +31,9 @@ type Limiter struct {
 	SpeedLimit    int
 	UserLimitInfo *sync.Map // Key: TagUUID value: UserLimitInfo
 	SpeedLimiter  *sync.Map // key: TagUUID, value: *ratelimit.Bucket
+	// ruleLock 保护 DomainRules/ProtocolRules：
+	// UpdateRule 整表替换（写锁），CheckDomainRule/CheckProtocolRule 并发读（读锁）。
+	ruleLock sync.RWMutex
 	// AliveList is guarded by aliveLock because nodeInfoMonitor replaces the
 	// whole map while UpdateUser/CheckLimit read/modify it concurrently.
 	aliveLock sync.RWMutex
@@ -42,6 +45,11 @@ type Limiter struct {
 	// 的唯一数据源，保证两通道写面板 Redis 设备表的口径一致，避免计数抖动。
 	refLock  sync.RWMutex
 	refCount map[int]map[string]int
+
+	// openGateMu 串行化「设备门禁裁决 + 连接计数」（TryOpenConn），
+	// 使 checkDeviceGate 裁决与 ConnOpened 计数原子化，
+	// 避免并发新连接在彼此计数前同时通过裁决而超出 deviceLimit。
+	openGateMu sync.Mutex
 
 	// globalDevices 是面板 WS 推送的全局设备表（uid → 在线 IP 集合），
 	// 跨所有节点去重，用于全局限数判断；由 globalLock 保护。
@@ -55,7 +63,6 @@ type UserLimitInfo struct {
 	UID         int
 	SpeedLimit  int
 	DeviceLimit int
-	OverLimit   bool
 }
 
 func AddLimiter(tag string, l *conf.LimitConfig, users []panel.UserInfo, aliveList map[int]int) *Limiter {
@@ -76,7 +83,6 @@ func AddLimiter(tag string, l *conf.LimitConfig, users []panel.UserInfo, aliveLi
 		if users[i].DeviceLimit != 0 {
 			userLimit.DeviceLimit = users[i].DeviceLimit
 		}
-		userLimit.OverLimit = false
 		info.UserLimitInfo.Store(format.UserTag(tag, users[i].Uuid), userLimit)
 	}
 	limitLock.Lock()
@@ -140,7 +146,6 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 			u.SpeedLimit = modified[i].SpeedLimit
 			u.DeviceLimit = modified[i].DeviceLimit
 			u.mu.Unlock()
-			l.UserLimitInfo.Store(format.UserTag(tag, modified[i].Uuid), u)
 		}
 		// Drop the cached bucket so CheckLimit rebuilds it at the new rate.
 		l.SpeedLimiter.Delete(format.UserTag(tag, modified[i].Uuid))
@@ -155,7 +160,6 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 		if added[i].DeviceLimit != 0 {
 			userLimit.DeviceLimit = added[i].DeviceLimit
 		}
-		userLimit.OverLimit = false
 		l.UserLimitInfo.Store(format.UserTag(tag, added[i].Uuid), userLimit)
 	}
 }
@@ -187,15 +191,19 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noSSUDP bool) (Bucket *r
 	if userLimit < 0 {
 		userLimit = 0
 	}
-	if deviceLimit > 0 {
+	if noSSUDP {
+		// 仅 TCP 连接计数（对齐官方 Xboard-Node：UDP 会话只裁决、不占用设备数）。
+		// 裁决 + 计数原子化（TryOpenConn），避免并发新连接同时通过门禁导致超限；
+		// 连接关闭时由 dispatcher 回调 ConnClosed 递减。
+		if !l.TryOpenConn(uid, ip, deviceLimit) {
+			return nil, true
+		}
+	} else if deviceLimit > 0 {
+		// UDP：只裁决不计数（只读无副作用、无竞态）。checkDeviceGate 内部
+		// 优先全局表（WS sync.devices），过期时回退本地 + alivelist 兜底。
 		if l.checkDeviceGate(uid, ip, deviceLimit) {
 			return nil, true
 		}
-	}
-	if noSSUDP {
-		// 仅 TCP 连接计数（对齐官方 Xboard-Node：UDP 会话只裁决、不占用设备数）。
-		// 放行：连接级计数 +1，连接关闭时由 dispatcher 回调 ConnClosed 递减
-		l.ConnOpened(taguuid, uid, ip)
 	}
 
 	limit := int64(determineSpeedLimit(nodeLimit, userLimit)) * 1000000 / 8 // If you need the Speed limit
@@ -213,7 +221,7 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noSSUDP bool) (Bucket *r
 // GetOnlineDevice 返回本节点当前活跃设备快照（连接级 refCount）。
 // 与 LocalDeviceSnapshot（WS report.devices）同源，保证 REST alive 与 WS
 // 两通道写面板 Redis 设备表的口径一致，避免设备计数周期抖动。
-func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
+func (l *Limiter) GetOnlineDevice() *[]panel.OnlineUser {
 	l.refLock.RLock()
 	defer l.refLock.RUnlock()
 	var onlineUser []panel.OnlineUser
@@ -222,7 +230,7 @@ func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 			onlineUser = append(onlineUser, panel.OnlineUser{UID: uid, IP: ip})
 		}
 	}
-	return &onlineUser, nil
+	return &onlineUser
 }
 
 // UpdateGlobalDevices 以面板 WS 推送的全量设备表覆盖本地全局表，并刷新新鲜度。
@@ -261,8 +269,23 @@ func (l *Limiter) LocalDeviceSnapshot() map[int][]string {
 	return out
 }
 
+// TryOpenConn 原子化执行「设备门禁裁决 + 连接计数」。
+// 在 openGateMu 串行化下完成，保证并发的新 TCP 连接不会在彼此计数前
+// 同时通过 checkDeviceGate 而超出 deviceLimit。
+// 返回 false 表示被门禁拒绝（不计数）；true 表示放行并已计数。
+func (l *Limiter) TryOpenConn(uid int, ip string, deviceLimit int) bool {
+	ip = strings.TrimPrefix(ip, "::ffff:")
+	l.openGateMu.Lock()
+	defer l.openGateMu.Unlock()
+	if deviceLimit > 0 && l.checkDeviceGate(uid, ip, deviceLimit) {
+		return false
+	}
+	l.ConnOpened(uid, ip)
+	return true
+}
+
 // ConnOpened 记录一条 TCP 连接建立（放行后调用），连接级计数 +1。
-func (l *Limiter) ConnOpened(taguuid string, uid int, ip string) {
+func (l *Limiter) ConnOpened(uid int, ip string) {
 	ip = strings.TrimPrefix(ip, "::ffff:")
 	l.refLock.Lock()
 	m := l.refCount[uid]

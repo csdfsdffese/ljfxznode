@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/csdfsdffese/ljfxznode/api/panel"
@@ -24,18 +25,19 @@ type Controller struct {
 	tag                     string
 	limiter                 *limiter.Limiter
 	userList                []panel.UserInfo
-	aliveMap                map[int]int
+	userListMu              sync.Mutex   // 保护 userList（nodeInfoMonitor 写 / WS sync.user.delta 回调读）
+	stateMu                 sync.RWMutex // 保护 info/tag/limiter（任务 goroutine 写 / WS 回调读）
 	pendingTraffic          []panel.UserTraffic
 	info                    *panel.NodeInfo
 	nodeInfoMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	statusReportPeriodic    *task.Task
 	renewCertPeriodic       *task.Task
-	onlineIpReportPeriodic  *task.Task
 	deviceReportPeriodic    *task.Task
 	statusChecker           *statusChecker
 	wsClient                *panel.WSClient
 	wsCancel                context.CancelFunc
+	deviceReportMu          sync.Mutex // 保护 lastReportDevicesHash（WS 重连回调与上报任务并发访问）
 	lastReportDevicesHash   string
 	*conf.Options
 }
@@ -71,9 +73,12 @@ func (c *Controller) Start() error {
 		// panel returns them.
 		log.Warn("no user received from panel, waiting for the next pull")
 	}
-	c.aliveMap, err = c.apiClient.GetUserAlive()
+	aliveMap, err := c.apiClient.GetUserAlive()
 	if err != nil {
-		return fmt.Errorf("failed to get user alive list: %s", err)
+		// 启动时 alivelist 失败不阻断节点启动：以空表继续，alivelist 兜底
+		// 会在后续 nodeInfoMonitor 轮询恢复；真正的全局限数由 WS 通道承载。
+		log.WithField("tag", c.tag).Warn("failed to get alive list, continue with empty list")
+		aliveMap = make(map[int]int)
 	}
 	if len(c.Options.Name) == 0 {
 		c.tag = c.buildNodeTag(node)
@@ -82,7 +87,7 @@ func (c *Controller) Start() error {
 	}
 
 	// add limiter
-	l := limiter.AddLimiter(c.tag, &c.LimitConfig, c.userList, c.aliveMap)
+	l := limiter.AddLimiter(c.tag, &c.LimitConfig, c.userList, aliveMap)
 	// add rule limiter
 	if err = l.UpdateRule(&node.Rules); err != nil {
 		return fmt.Errorf("update rule error: %s", err)
@@ -132,9 +137,6 @@ func (c *Controller) Close() error {
 	if c.renewCertPeriodic != nil {
 		c.renewCertPeriodic.Close()
 	}
-	if c.onlineIpReportPeriodic != nil {
-		c.onlineIpReportPeriodic.Close()
-	}
 	if c.deviceReportPeriodic != nil {
 		c.deviceReportPeriodic.Close()
 	}
@@ -149,9 +151,12 @@ func (c *Controller) Close() error {
 // Failures are logged only so that a transient panel outage never stops the task.
 func (c *Controller) reportStatusTask() error {
 	status := c.statusChecker.collect()
+	c.stateMu.RLock()
+	tag := c.tag
+	c.stateMu.RUnlock()
 	if err := c.apiClient.ReportNodeStatus(status); err != nil {
 		log.WithFields(log.Fields{
-			"tag": c.tag,
+			"tag": tag,
 			"err": err,
 		}).Debug("Report node status failed")
 	}
@@ -179,11 +184,24 @@ func (c *Controller) startWS() {
 		c.apiClient.Key,
 		c.apiClient.NodeId,
 		func(devices map[int][]string) {
+			c.stateMu.RLock()
 			c.limiter.UpdateGlobalDevices(devices)
+			c.stateMu.RUnlock()
 		},
 		func(connected bool) {
+			if connected {
+				// WS 重连成功后强制重发一次设备快照：面板在 onClose 时会清空
+				// 该节点的设备记录，若仍沿用断线前的 hash 将永不重发，
+				// 导致全局限数丢失该节点的在线设备。
+				c.deviceReportMu.Lock()
+				c.lastReportDevicesHash = ""
+				c.deviceReportMu.Unlock()
+			}
 			log.WithFields(log.Fields{"tag": c.tag, "connected": connected}).
 				Info("Panel WebSocket status changed")
+		},
+		func(userIDs []int) {
+			c.removeUsersByIDs(userIDs)
 		},
 	)
 	log.WithField("tag", c.tag).Infof("Panel WebSocket enabled, connecting %s", hs.WebSocket.WSURL)
@@ -202,23 +220,80 @@ func (c *Controller) startWS() {
 // 面板收到 report.devices 后聚合写 Redis 并周期回推 sync.devices，
 // 节点据此更新全局设备表。WS 未连接时跳过（REST alive 上报作兜底）。
 // 设备集合无变化时不重复上报（对齐官方 sha256 去重），避免面板每 10s
-// 全量重写 Redis 设备表造成写放大。
+// 全量重写 Redis 设备表造成写放大。发送失败（队列满/未连接）时不保存
+// hash，下一轮无条件重试，保证该次设备变化不因队列丢弃而永久丢失。
 func (c *Controller) reportDevicesTask() error {
 	if c.wsClient == nil || !c.wsClient.IsConnected() {
 		return nil
 	}
+	c.stateMu.RLock()
 	devices := c.limiter.LocalDeviceSnapshot()
+	c.stateMu.RUnlock()
 	if len(devices) == 0 {
+		c.deviceReportMu.Lock()
 		c.lastReportDevicesHash = ""
+		c.deviceReportMu.Unlock()
 		return nil
 	}
 	hash := devicesHash(devices)
-	if hash == c.lastReportDevicesHash {
+	c.deviceReportMu.Lock()
+	changed := hash != c.lastReportDevicesHash
+	c.deviceReportMu.Unlock()
+	if !changed {
 		return nil
 	}
+	if !c.wsClient.SendDeviceReport(devices) {
+		return nil
+	}
+	c.deviceReportMu.Lock()
 	c.lastReportDevicesHash = hash
-	c.wsClient.SendDeviceReport(devices)
+	c.deviceReportMu.Unlock()
 	return nil
+}
+
+// removeUsersByIDs 处理面板 sync.user.delta（流量超限等主动移除通知）。
+// 只从 Xray 与 limiter 中删除命中用户，不修改 userList —— 下一轮
+// nodeInfoMonitor 拉取的用户列表本身不含这些用户（面板已过滤），
+// compareUserList 会自然完成列表收敛，避免与本任务并发写 userList。
+// 若"面板已过滤"假设失效（例如面板尚未生效时 nodeInfoMonitor 先拿到旧列表
+// 重新 AddUsers），被删用户会在下一轮 nodeInfo 对比中再次被处理。
+func (c *Controller) removeUsersByIDs(ids []int) {
+	if len(ids) == 0 {
+		return
+	}
+	// 先去重待删 id，避免双重循环 O(n×m)
+	want := make(map[int]struct{}, len(ids))
+	for _, id := range ids {
+		want[id] = struct{}{}
+	}
+	c.userListMu.Lock()
+	var deleted []panel.UserInfo
+	for _, u := range c.userList {
+		if _, ok := want[u.Id]; ok {
+			deleted = append(deleted, u)
+		}
+	}
+	c.userListMu.Unlock()
+	if len(deleted) == 0 {
+		return
+	}
+	c.stateMu.RLock()
+	info := c.info
+	c.stateMu.RUnlock()
+	if info == nil {
+		return
+	}
+	if err := c.server.DelUsers(deleted, c.tag, info); err != nil {
+		log.WithFields(log.Fields{
+			"tag": c.tag,
+			"err": err,
+		}).Warn("remove exceeded users failed")
+		return
+	}
+	c.stateMu.RLock()
+	c.limiter.UpdateUser(c.tag, nil, deleted, nil)
+	c.stateMu.RUnlock()
+	log.WithField("tag", c.tag).Infof("Removed %d exceeded users by sync.user.delta", len(deleted))
 }
 
 // devicesHash 计算设备快照的确定性哈希（uid+ip 排序拼接后 sha256）。

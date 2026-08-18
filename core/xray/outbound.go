@@ -21,8 +21,8 @@ func buildOutbound(config *conf2.Options, tag string) (*core.OutboundHandlerConf
 		outboundDetourConfig.SendThrough = &config.SendIP
 	}
 
-	// Freedom Protocol setting
-	var domainStrategy = "Asis"
+	// Freedom Protocol setting（AsIs 是 xray DomainStrategy 的合法取值，勿拼成 Asis）
+	var domainStrategy = "AsIs"
 	if config.XrayOptions.EnableDNS {
 		if config.XrayOptions.DNSType != "" {
 			domainStrategy = config.XrayOptions.DNSType

@@ -51,6 +51,8 @@ func applyLogConfig(c *conf.Conf) {
 		f, err := os.OpenFile(c.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			log.WithField("err", err).Error("Open log file failed, using stdout instead")
+			// OpenFile 失败时 f 为 nil，继续 SetOutput 会把日志写到 nil writer 造成静默丢失
+			return
 		}
 		log.SetOutput(f)
 	}
@@ -110,7 +112,10 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		select {
 		case <-osSignals:
 			log.Info("Received exit signal, shutting down...")
-			os.Exit(0)
+			// 先停节点控制器再 return，走 defer vc.Close() 优雅关闭 core；
+			// 不要用 os.Exit(0)，它会跳过所有 defer 导致连接未清理
+			nodes.Close()
+			return
 		case <-reloadCh:
 			log.Info("Received reload signal, reloading config...")
 			if err := reload(config, &vc, &nodes, &c); err != nil {

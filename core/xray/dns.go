@@ -2,6 +2,7 @@ package xray
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -42,9 +43,10 @@ func updateDNSConfig(node *panel.NodeInfo) (err error) {
 				if err != nil {
 					return err
 				}
-				var uint16Port uint16
-				if port, err := strconv.ParseUint(port, 10, 16); err == nil {
-					uint16Port = uint16(port)
+				// 端口解析失败直接报错，而不是静默写 0 端口（0 是非法的 DNS 服务端口）
+				uint16Port, err := strconv.ParseUint(port, 10, 16)
+				if err != nil {
+					return fmt.Errorf("invalid dns server port %q: %w", port, err)
 				}
 				value["address"] = host
 				value["port"] = uint16Port

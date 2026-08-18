@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"encoding/json"
 
@@ -149,9 +148,9 @@ func buildInbound(option *conf.Options, nodeInfo *panel.NodeInfo, tag string) (*
 			return nil, fmt.Errorf("marshal reality dest error: %s", err)
 		}
 		xver := ts.Xver
-		// RealityConfig is never unmarshalled (json:"-"), so it is always
-		// zero values; keep it local so trojan nodes (nil VAllss) don't panic.
-		mtd, _ := time.ParseDuration("")
+		// 面板 TlsSettings 未下发 min/max client version 与 max time diff
+		// （Xboard 协议无这些字段），保持零值即可；原 time.ParseDuration("")
+		// 恒解析失败返回 0，属于死代码。
 		in.StreamSetting.REALITYSettings = &coreConf.REALITYConfig{
 			Dest:         d,
 			Xver:         xver,
@@ -160,7 +159,7 @@ func buildInbound(option *conf.Options, nodeInfo *panel.NodeInfo, tag string) (*
 			PrivateKey:   ts.PrivateKey,
 			MinClientVer: "",
 			MaxClientVer: "",
-			MaxTimeDiff:  uint64(mtd.Microseconds()),
+			MaxTimeDiff:  0,
 			ShortIds:     ts.EffectiveShortIds(),
 			Mldsa65Seed:  ts.Mldsa65Seed,
 		}
@@ -232,43 +231,53 @@ func buildV2ray(config *conf.Options, nodeInfo *panel.NodeInfo, inbound *coreCon
 		inbound.Settings = (*json.RawMessage)(&s)
 	}
 	// 面板下发未配置传输层的节点时 networkSettings 为字面 null（JSON "null"），
-	// 与缺失字段等价，一律视为空配置走 xray 默认值。
-	if len(v.NetworkSettings) == 0 || strings.TrimSpace(string(v.NetworkSettings)) == "null" {
+	// 与缺失字段等价，一律视为空配置走 xray 默认值（applyTransportSettings 处理）。
+	return applyTransportSettings(config, v.Network, v.NetworkSettings, inbound)
+}
+
+// applyTransportSettings 解析传输层配置：network 为空时兜底 tcp；
+// networkSettings 为空或字面 null 时跳过反序列化（xray 默认值）。
+// vmess/vless 与 trojan 共用，避免两份相同的 switch。
+func applyTransportSettings(config *conf.Options, network string, networkSettings json.RawMessage, inbound *coreConf.InboundDetourConfig) error {
+	if network == "" {
+		network = "tcp"
+	}
+	t := coreConf.TransportProtocol(network)
+	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
+	if len(networkSettings) == 0 || strings.TrimSpace(string(networkSettings)) == "null" {
+		applySocketSettings(config, networkSettings, inbound)
 		return nil
 	}
-
-	t := coreConf.TransportProtocol(v.Network)
-	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
-	switch v.Network {
+	switch network {
 	case "tcp":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.TCPSettings)
+		err := json.Unmarshal(networkSettings, &inbound.StreamSetting.TCPSettings)
 		if err != nil {
 			return fmt.Errorf("unmarshal tcp settings error: %s", err)
 		}
 	case "ws":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.WSSettings)
+		err := json.Unmarshal(networkSettings, &inbound.StreamSetting.WSSettings)
 		if err != nil {
 			return fmt.Errorf("unmarshal ws settings error: %s", err)
 		}
 	case "grpc":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.GRPCSettings)
+		err := json.Unmarshal(networkSettings, &inbound.StreamSetting.GRPCSettings)
 		if err != nil {
 			return fmt.Errorf("unmarshal grpc settings error: %s", err)
 		}
 	case "httpupgrade":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.HTTPUPGRADESettings)
+		err := json.Unmarshal(networkSettings, &inbound.StreamSetting.HTTPUPGRADESettings)
 		if err != nil {
 			return fmt.Errorf("unmarshal httpupgrade settings error: %s", err)
 		}
 	case "splithttp", "xhttp":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.SplitHTTPSettings)
+		err := json.Unmarshal(networkSettings, &inbound.StreamSetting.SplitHTTPSettings)
 		if err != nil {
 			return fmt.Errorf("unmarshal xhttp settings error: %s", err)
 		}
 	default:
 		return errors.New("the network type is not vail")
 	}
-	applySocketSettings(config, v.NetworkSettings, inbound)
+	applySocketSettings(config, networkSettings, inbound)
 	return nil
 }
 
@@ -292,49 +301,9 @@ func buildTrojan(config *conf.Options, nodeInfo *panel.NodeInfo, inbound *coreCo
 		s := []byte("{}")
 		inbound.Settings = (*json.RawMessage)(&s)
 	}
-	network := v.Network
-	if network == "" {
-		network = "tcp"
-	}
-	t := coreConf.TransportProtocol(network)
-	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}
 	// networkSettings may be null/absent when the panel sends an empty config;
 	// keep xray defaults in that case instead of failing to unmarshal nil.
-	if len(v.NetworkSettings) == 0 || strings.TrimSpace(string(v.NetworkSettings)) == "null" {
-		applySocketSettings(config, v.NetworkSettings, inbound)
-		return nil
-	}
-	switch network {
-	case "tcp":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.TCPSettings)
-		if err != nil {
-			return fmt.Errorf("unmarshal tcp settings error: %s", err)
-		}
-	case "ws":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.WSSettings)
-		if err != nil {
-			return fmt.Errorf("unmarshal ws settings error: %s", err)
-		}
-	case "grpc":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.GRPCSettings)
-		if err != nil {
-			return fmt.Errorf("unmarshal grpc settings error: %s", err)
-		}
-	case "httpupgrade":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.HTTPUPGRADESettings)
-		if err != nil {
-			return fmt.Errorf("unmarshal httpupgrade settings error: %s", err)
-		}
-	case "splithttp", "xhttp":
-		err := json.Unmarshal(v.NetworkSettings, &inbound.StreamSetting.SplitHTTPSettings)
-		if err != nil {
-			return fmt.Errorf("unmarshal xhttp settings error: %s", err)
-		}
-	default:
-		return errors.New("the network type is not vail")
-	}
-	applySocketSettings(config, v.NetworkSettings, inbound)
-	return nil
+	return applyTransportSettings(config, v.Network, v.NetworkSettings, inbound)
 }
 
 // applySocketSettings parses socketSettings from networkSettings and forwards

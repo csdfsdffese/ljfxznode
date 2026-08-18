@@ -3,9 +3,11 @@ package xray
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/csdfsdffese/ljfxznode/api/panel"
 	"github.com/csdfsdffese/ljfxznode/conf"
+	"github.com/csdfsdffese/ljfxznode/core/xray/app/dispatcher"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
@@ -82,6 +84,20 @@ func (c *Xray) DelNode(tag string) error {
 	if err != nil {
 		return fmt.Errorf("remove out error: %s", err)
 	}
+	// 清理节点级残留状态（DelUsers 只清理被删用户条目，节点整体下线时兜底）：
+	// 上报阈值 map、节点流量计数器、以及该 tag 下仍在线的连接管理器。
+	c.trafficMu.Lock()
+	delete(c.nodeReportMinTrafficBytes, tag)
+	c.trafficMu.Unlock()
+	c.dispatcher.Counter.Delete(tag)
+	c.dispatcher.LinkManagers.Range(func(key, value interface{}) bool {
+		if strings.HasPrefix(key.(string), tag+"|") {
+			lm := value.(*dispatcher.LinkManager)
+			lm.CloseAll()
+			c.dispatcher.LinkManagers.Delete(key)
+		}
+		return true
+	})
 	return nil
 }
 

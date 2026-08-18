@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/url"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,8 +18,10 @@ import (
 
 // WS 事件类型（与面板 NodeEventHandlers 对齐）
 const (
-	WSEventSyncDevices   = "sync.devices"   // 面板 → 节点：全局设备状态
-	WSEventReportDevices = "report.devices" // 节点 → 面板：上报本地设备
+	WSEventSyncDevices    = "sync.devices"    // 面板 → 节点：全局设备状态
+	WSEventReportDevices  = "report.devices"  // 节点 → 面板：上报本地设备
+	WSEventRequestDevices = "request.devices" // 节点 → 面板：主动请求全局设备状态
+	WSEventSyncUserDelta  = "sync.user.delta" // 面板 → 节点：用户变更（流量超限移除等）
 )
 
 // wsMessage 是所有 WS 消息的 JSON 信封。
@@ -41,25 +44,31 @@ type syncDevicesPayload struct {
 // 断线后由 Run 负责指数退避重连；设备状态在断线期间保留旧数据，
 // 由调用方配合 alivelist 轮询兜底。
 type WSClient struct {
-	wsURL    string
-	token    string
-	nodeID   int
-	onDevice func(users map[int][]string)
-	onStatus func(connected bool)
+	wsURL         string
+	token         string
+	nodeID        int
+	onDevice      func(users map[int][]string)
+	onStatus      func(connected bool)
+	onRemoveUsers func(userIDs []int)
 
 	connected atomic.Bool
+	// writeChMu 保护 writeCh：connect（Run goroutine）赋值/置 nil，
+	// SendDeviceReport（上报任务 goroutine）读取，两者需要互斥。
+	writeChMu sync.Mutex
 	writeCh   chan wsMessage
 }
 
 // NewWSClient 创建 WS 客户端。
 // wsURL 为面板返回的 ws(s):// 地址；token/nodeID 复用 REST 凭据。
-func NewWSClient(wsURL, token string, nodeID int, onDevice func(map[int][]string), onStatus func(bool)) *WSClient {
+// onRemoveUsers 接收面板 sync.user.delta 的移除用户 ID 列表（流量超限主动通知）。
+func NewWSClient(wsURL, token string, nodeID int, onDevice func(map[int][]string), onStatus func(bool), onRemoveUsers func([]int)) *WSClient {
 	return &WSClient{
-		wsURL:    wsURL,
-		token:    token,
-		nodeID:   nodeID,
-		onDevice: onDevice,
-		onStatus: onStatus,
+		wsURL:         wsURL,
+		token:         token,
+		nodeID:        nodeID,
+		onDevice:      onDevice,
+		onStatus:      onStatus,
+		onRemoveUsers: onRemoveUsers,
 	}
 }
 
@@ -149,8 +158,22 @@ func (w *WSClient) connect(ctx context.Context) error {
 	}
 
 	writeCh := make(chan wsMessage, 16)
+	w.writeChMu.Lock()
 	w.writeCh = writeCh
-	defer func() { w.writeCh = nil }()
+	w.writeChMu.Unlock()
+	defer func() {
+		w.writeChMu.Lock()
+		w.writeCh = nil
+		w.writeChMu.Unlock()
+	}()
+
+	// 主动请求全局设备状态：面板 pushFullSync 不推 sync.devices，
+	// 若不主动请求，节点全局表要到下一次设备上报被回推后才就绪，
+	// 存在全局限数盲区（最长约 10s+60s）。
+	select {
+	case writeCh <- wsMessage{Event: WSEventRequestDevices}:
+	default:
+	}
 
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -181,7 +204,12 @@ func (w *WSClient) connect(ctx context.Context) error {
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_ = conn.WriteMessage(websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			<-done
+			// reader goroutine 可能因服务器不响应 CloseMessage 而永久阻塞，
+			// 加超时避免 connect 永不返回。
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
 			return nil
 
 		case err := <-errCh:
@@ -206,6 +234,29 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 		}
 		if w.onDevice != nil {
 			w.onDevice(users)
+		}
+	case WSEventSyncUserDelta:
+		var payload struct {
+			Action string `json:"action"`
+			Users  []struct {
+				Id int `json:"id"`
+			} `json:"users"`
+		}
+		if err := json.Unmarshal(msg.Data, &payload); err != nil {
+			log.WithField("err", err).Warn("ws: decode sync.user.delta failed")
+			return
+		}
+		if payload.Action != "remove" || w.onRemoveUsers == nil {
+			return
+		}
+		ids := make([]int, 0, len(payload.Users))
+		for _, u := range payload.Users {
+			if u.Id > 0 {
+				ids = append(ids, u.Id)
+			}
+		}
+		if len(ids) > 0 {
+			w.onRemoveUsers(ids)
 		}
 	case "ping":
 		// pong 由读循环回写
@@ -250,23 +301,32 @@ func decodeSyncDevices(raw json.RawMessage) (map[int][]string, error) {
 }
 
 // SendDeviceReport 通过 WS 上报本地设备快照（userID → IP 列表）。
-// 未连接时静默丢弃（调用方应保留 REST alive 上报作为兜底）。
-func (w *WSClient) SendDeviceReport(devices map[int][]string) {
+// 未连接或写队列满时返回 false（调用方应保留 hash 并在下一轮重试，
+// 避免该次设备变化因队列丢弃而永久丢失）。
+func (w *WSClient) SendDeviceReport(devices map[int][]string) bool {
 	if !w.connected.Load() || len(devices) == 0 {
-		return
+		return false
 	}
 	data, err := json.Marshal(devices)
 	if err != nil {
-		return
+		return false
 	}
 	msg := wsMessage{
 		Event:     WSEventReportDevices,
 		Data:      data,
 		Timestamp: time.Now().Unix(),
 	}
+	w.writeChMu.Lock()
+	ch := w.writeCh
+	w.writeChMu.Unlock()
+	if ch == nil {
+		return false
+	}
 	select {
-	case w.writeCh <- msg:
+	case ch <- msg:
+		return true
 	default:
 		log.Warn("ws write channel full, skipping device report")
+		return false
 	}
 }

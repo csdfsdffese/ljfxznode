@@ -69,8 +69,7 @@ type VAllssNode struct {
 	ServerName          string          `json:"server_name"`
 
 	// vless only
-	Flow          string        `json:"flow"`
-	RealityConfig RealityConfig `json:"-"`
+	Flow string `json:"flow"`
 }
 
 type TlsSettings struct {
@@ -114,13 +113,6 @@ type EncSettings struct {
 	Ticket        string `json:"ticket"`
 	ServerPadding string `json:"server_padding"`
 	PrivateKey    string `json:"private_key"`
-}
-
-type RealityConfig struct {
-	Xver         uint64 `json:"Xver"`
-	MinClientVer string `json:"MinClientVer"`
-	MaxClientVer string `json:"MaxClientVer"`
-	MaxTimeDiff  string `json:"MaxTimeDiff"`
 }
 
 type ShadowsocksNode struct {

@@ -24,12 +24,12 @@ type rawNodeConfig struct {
 }
 
 type ApiConfig struct {
-	APIHost      string `json:"ApiHost"`
-	APISendIP    string `json:"ApiSendIP"`
-	NodeID       int    `json:"NodeID"`
-	Key          string `json:"ApiKey"`
-	NodeType     string `json:"NodeType"`
-	Timeout      int    `json:"Timeout"`
+	APIHost   string `json:"ApiHost"`
+	APISendIP string `json:"ApiSendIP"`
+	NodeID    int    `json:"NodeID"`
+	Key       string `json:"ApiKey"`
+	NodeType  string `json:"NodeType"`
+	Timeout   int    `json:"Timeout"`
 }
 
 func (n *NodeConfig) UnmarshalJSON(data []byte) (err error) {
@@ -39,9 +39,10 @@ func (n *NodeConfig) UnmarshalJSON(data []byte) (err error) {
 		return err
 	}
 	if len(rn.Include) != 0 {
+		// 支持 ":https://.../config.json" 与 "https://.../config.json" 两种写法，
+		// 用前缀判断而非精确相等，否则远程 URL 永远落进 os.Open 分支而失败。
 		file, _ := strings.CutPrefix(rn.Include, ":")
-		switch file {
-		case "http", "https":
+		if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
 			rsp, err := http.Get(file)
 			if err != nil {
 				return err
@@ -51,7 +52,7 @@ func (n *NodeConfig) UnmarshalJSON(data []byte) (err error) {
 			if err != nil {
 				return fmt.Errorf("open include file error: %s", err)
 			}
-		default:
+		} else {
 			f, err := os.Open(rn.Include)
 			if err != nil {
 				return fmt.Errorf("open include file error: %s", err)

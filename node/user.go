@@ -27,9 +27,7 @@ func (c *Controller) reportUserTrafficTask() (err error) {
 		}
 	}
 
-	if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
-		log.Print(err)
-	} else if len(*onlineDevice) > 0 {
+	if onlineDevice := c.limiter.GetOnlineDevice(); len(*onlineDevice) > 0 {
 		// 仅当配置了 DeviceOnlineMinTraffic(>0) 时才过滤低流量用户，
 		// 默认全部上报，避免挂机 IP 漏报导致全局设备计数偏小。
 		var result []panel.OnlineUser
@@ -63,7 +61,6 @@ func (c *Controller) reportUserTrafficTask() (err error) {
 		}
 	}
 
-	userTraffic = nil
 	return nil
 }
 
