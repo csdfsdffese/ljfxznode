@@ -19,6 +19,13 @@ import (
 // 超过该窗口未收到面板 WS 推送则回退到 alivelist 轮询兜底。
 const globalDevicesStaleAfter = 60 * time.Second
 
+// kickCooldownDuration 是被踢 IP 的冷却占坑时长。
+// 被踢的 IP 在冷却期内由 LocalDeviceSnapshot 继续上报（占坑），锁定面板
+// 全局设备表，配合 checkDeviceGate 的规则 A（全局有、本地无 → 拒绝）
+// 实现跨节点拒绝被踢 IP 重连；冷却结束停止上报，面板 TTL(300s) 过期后
+// 自然解禁。保守取值 = 面板设备 TTL（最坏解禁时间约 10 分钟，已与用户确认）。
+const kickCooldownDuration = 300 * time.Second
+
 // gateShards 是设备门禁分片锁的数量（须为 2 的幂，按 uid 取模）。
 // TryOpenConn 只需保证「同一用户的裁决+计数」原子——不同用户互不影响，
 // 因此用分片锁替代全局锁，避免全节点 TCP 建连被单一互斥锁串行化（高并发瓶颈）。
@@ -107,6 +114,20 @@ type Limiter struct {
 	// 避免并发新连接各自踢一个 victim 造成「剔除风暴」同时断开多个
 	// 在线用户（一次剔除腾出的名额远比单个新连接大，节流不损收敛速度）。
 	kickThrottle [gateShards]int64
+
+	// kickCooldown 是被踢 IP 的冷却占坑名单，分片下标与 gateLocks 一致、
+	// 由对应 gateLock 保护：uid → ip → 过期时间。被踢的 IP 在冷却期内由
+	// LocalDeviceSnapshot 继续上报（占坑），使面板全局表保留该 IP，
+	// 配合 checkDeviceGate 的规则 A（全局有、本地无 → 拒绝）实现跨节点
+	// 拒绝被踢 IP 重连；冷却到期停止上报，面板 TTL 过期后自然解禁。
+	// 写入仅发生在 kickDevice（异步剔除路径，低频）；读取发生在上报任务
+	// （每 10s，LocalDeviceSnapshot 合并）与 TryOpenConn 的冷却拒绝
+	// （inCooldown），全部经对应 gateLock 分片保护，与连接数据路径隔离，
+	// 不影响建连速度。
+	kickCooldown [gateShards]map[int]map[string]time.Time
+	// cooldownCount 是活跃冷却条目的原子计数。purge/快照合并用它快速跳过
+	// 全空冷却名单的分片锁遍历（无冷却条目时每 10s 空转 256 把锁的 CPU 可省则省）。
+	cooldownCount atomic.Int64
 
 	// globalDevices 是面板 WS 推送的全局设备表（uid → 在线 IP 集合），
 	// 跨所有节点去重，用于全局限数判断；由 globalLock 保护。
@@ -219,6 +240,16 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 		delete(l.globalDevices, deleted[i].Id)
 		delete(l.globalCount, deleted[i].Id)
 		l.globalLock.Unlock()
+		// 清理该用户的冷却占坑条目：已删用户无需继续占坑上报
+		// （面板已移除其用户记录，继续上报只会残留孤儿 IP）。
+		l.gateLock(deleted[i].Id).Lock()
+		if cd := &l.kickCooldown[uint(deleted[i].Id)&(gateShards-1)]; len(*cd) > 0 {
+			if ips, ok := (*cd)[deleted[i].Id]; ok {
+				l.cooldownCount.Add(int64(-len(ips)))
+				delete(*cd, deleted[i].Id)
+			}
+		}
+		l.gateLock(deleted[i].Id).Unlock()
 		l.deviceDirty.Store(true)
 	}
 	for i := range modified {
@@ -341,8 +372,9 @@ func (l *Limiter) UpdateGlobalDevices(users map[int][]string) {
 	l.globalLock.Unlock()
 }
 
-// LocalDeviceSnapshot 返回本节点当前活跃设备快照（userID → IP 列表，连接级）。
-// 供 WS report.devices 周期上报；只读，不清理任何状态。
+// LocalDeviceSnapshot 返回本节点当前上报设备快照（userID → IP 列表）：
+// 活跃连接（连接级 refCount）+ 冷却占坑 IP（被踢后继续上报，锁定面板
+// 全局表阻止其换节点重连）。供 WS report.devices 周期上报；只读，不清理状态。
 func (l *Limiter) LocalDeviceSnapshot() map[int][]string {
 	out := make(map[int][]string)
 	for i := range l.refShards {
@@ -357,11 +389,84 @@ func (l *Limiter) LocalDeviceSnapshot() map[int][]string {
 		}
 		sh.mu.RUnlock()
 	}
+	// 合并冷却占坑 IP。与 refShards 分开独立加锁遍历（无嵌套锁，
+	// 与 TryOpenConn 的 gateLock→refShard 顺序不构成 ABBA 死锁）；
+	// 冷却名单为空时原子计数快速跳过，无额外 CPU 开销。
+	if l.cooldownCount.Load() == 0 {
+		return out
+	}
+	now := time.Now()
+	for i := range l.gateLocks {
+		lk := &l.gateLocks[i]
+		lk.Lock()
+		cd := l.kickCooldown[i]
+		for uid, ips := range cd {
+			cur := out[uid]
+			for ip, exp := range ips {
+				if now.Before(exp) {
+					// 断连是异步的：占坑 IP 可能仍短暂存在于 refShards，
+					// 去重避免同一 IP 重复上报（影响 hash 稳定性）。
+					dup := false
+					for _, e := range cur {
+						if e == ip {
+							dup = true
+							break
+						}
+					}
+					if !dup {
+						cur = append(cur, ip)
+					}
+				}
+			}
+			out[uid] = cur
+		}
+		lk.Unlock()
+	}
 	return out
 }
 
 // DevicesDirty 报告设备快照自上次评估以来是否发生变化。
-func (l *Limiter) DevicesDirty() bool { return l.deviceDirty.Load() }
+// 顺带清理已到期的冷却占坑条目：本方法由上报任务每 10s 调用一次，
+// 无需新增 goroutine/timer（无冷却条目时原子计数快速跳过遍历）。
+// 冷却条目到期会移除占坑 IP、改变快照内容，必须返回 true 强制下一轮
+// 评估，否则上报任务的 hash 去重会跳过评估导致占坑永不解除。
+func (l *Limiter) DevicesDirty() bool {
+	// 无条件先清理冷却：若放在 || 右侧会被 deviceDirty 短路跳过，
+	// 高活跃节点（dirty 常为 true）下冷却条目将永不到期、占坑永锁。
+	removed := l.purgeExpiredCooldowns()
+	return l.deviceDirty.Load() || removed
+}
+
+// purgeExpiredCooldowns 删除所有已到期的冷却占坑条目。
+// 有删除返回 true（快照内容将变化），由 DevicesDirty 驱动下一轮上报评估。
+func (l *Limiter) purgeExpiredCooldowns() bool {
+	if l.cooldownCount.Load() == 0 {
+		return false
+	}
+	now := time.Now()
+	removed := false
+	for i := range l.gateLocks {
+		lk := &l.gateLocks[i]
+		lk.Lock()
+		for uid, ips := range l.kickCooldown[i] {
+			for ip, exp := range ips {
+				if !now.Before(exp) {
+					delete(ips, ip)
+					l.cooldownCount.Add(-1)
+					removed = true
+				}
+			}
+			if len(ips) == 0 {
+				delete(l.kickCooldown[i], uid)
+			}
+		}
+		lk.Unlock()
+	}
+	if removed {
+		l.deviceDirty.Store(true)
+	}
+	return removed
+}
 
 // ResetDevicesDirty 复位脏标记。WS 上报任务在成功评估（发送或确认无变化）后调用；
 // 发送失败时不复位，保证下一轮重试不丢失设备变化。
@@ -385,6 +490,13 @@ func (l *Limiter) TryOpenConn(uid int, taguuid string, ip string, deviceLimit in
 	lk := l.gateLock(uid)
 	lk.Lock()
 	defer lk.Unlock()
+	// 冷却拒绝：被踢 IP 在冷却期内一律拒绝新连接。放在裁决最前（即使本地
+	// 断链回调尚未归零也拒绝），判断纯本地、不依赖面板全局表——WS 断线
+	// （全局表过期、规则 A 失效）期间同样生效，被踢的 IP 至少无法重连本节点。
+	// 被踢 IP 已是既定剔除对象，拒绝时无需再选 victim。
+	if l.inCooldown(uid, ip) {
+		return false
+	}
 	reject, victim := l.checkDeviceGate(uid, ip, deviceLimit)
 	if reject {
 		if victim != "" {
@@ -407,12 +519,35 @@ func (l *Limiter) TryOpenConn(uid int, taguuid string, ip string, deviceLimit in
 }
 
 // kickDevice 执行剔除动作：本地断开 victim 的所有连接（dispatcher 回调），
-// 并向面板上报剔除请求（controller 回调），由面板转发给该 IP 在线的
-// 其他节点完成跨节点剔除。两者任一未注册则静默跳过对应环节。
+// 将被踢 IP 写入冷却占坑名单（冷却期内继续上报、锁定面板全局表，阻止其
+// 立刻换节点重连），并向面板上报剔除请求（controller 回调，面板转发给该
+// IP 在线的其他节点）。三者任一未注册则静默跳过对应环节。
 func (l *Limiter) kickDevice(uid int, taguuid string, ip string) {
+	// 本地断开优先：被踢 IP 真实断链后再写入冷却，避免占坑窗口内该 IP
+	// 仍真实在线导致面板表计数失真（断链回调 ConnClosed 异步归零，无碍）。
 	if fn := kickLocal.Load(); fn != nil {
 		(*fn)(taguuid, ip)
 	}
+	// 写入冷却占坑名单（分片锁保护；重复剔除同一 IP 时刷新到期时间，
+	// 不重复计数）。此后再被该 IP 连接，规则 A（全局有、本地无）直接拒绝。
+	lk := l.gateLock(uid)
+	lk.Lock()
+	shard := &l.kickCooldown[uint(uid)&(gateShards-1)]
+	if *shard == nil {
+		*shard = make(map[int]map[string]time.Time)
+	}
+	ips := (*shard)[uid]
+	if ips == nil {
+		ips = make(map[string]time.Time)
+		(*shard)[uid] = ips
+	}
+	if _, exists := ips[ip]; !exists {
+		l.cooldownCount.Add(1)
+	}
+	ips[ip] = time.Now().Add(kickCooldownDuration)
+	lk.Unlock()
+	// 占坑条目变化 → 置脏，强制下一轮上报把该 IP 锁进面板全局表。
+	l.deviceDirty.Store(true)
 	if fn := kickReporter.Load(); fn != nil {
 		(*fn)(uid, taguuid, ip)
 	}
@@ -421,6 +556,27 @@ func (l *Limiter) kickDevice(uid int, taguuid string, ip string) {
 // gateLock 返回 uid 对应的分片锁（取模 2 的幂，位运算取余）。
 func (l *Limiter) gateLock(uid int) *sync.Mutex {
 	return &l.gateLocks[uint(uid)&(gateShards-1)]
+}
+
+// inCooldown 判断 ip 是否处于冷却占坑期（被踢后禁止重连）。
+// 仅可在持有 gateLock(uid) 时调用（kickCooldown 与 gateLocks 同分片保护）。
+// cooldownCount 原子快速路径：无任何冷却条目时直接返回，避免空遍历。
+// 与 LocalDeviceSnapshot 的合并不同：这里只做存在性判断，过期条目由
+// purgeExpiredCooldowns 定期清理（此处不主动删，避免与上报路径竞争）。
+func (l *Limiter) inCooldown(uid int, ip string) bool {
+	if l.cooldownCount.Load() == 0 {
+		return false
+	}
+	cd := &l.kickCooldown[uint(uid)&(gateShards-1)]
+	if len(*cd) == 0 {
+		return false
+	}
+	if ips, ok := (*cd)[uid]; ok {
+		if exp, ok := ips[ip]; ok && time.Now().Before(exp) {
+			return true
+		}
+	}
+	return false
 }
 
 // ConnOpened 记录一条 TCP 连接建立（放行后调用），连接级计数 +1。
@@ -492,8 +648,12 @@ func (l *Limiter) checkDeviceGate(uid int, ip string, limit int) (reject bool, v
 		// 全局表新鲜：一律以 WS 数据为准（官方主路径），即使该用户无全局条目
 		// 或面板刚推过空表也不回退 alivelist，避免与 REST 旧计数互相矛盾。
 		if globalIPs[ip] {
+			// 规则 A：全局表有该 IP 且本地无活跃连接（上方已判定 local[ip]==0）
+			// → 该 IP 已绑定其他节点（或处于本节点的冷却占坑期），拒绝其在本
+			// 节点建立新连接。旧逻辑视为「同一设备」放行，导致同 IP 换节点可
+			// 连的漏网；本地有活跃连接时复连已在上方放行，此处不会误伤。
 			sh.mu.RUnlock()
-			return false, "" // 其他节点已知该 IP → 视为同一设备，放行
+			return true, ""
 		}
 		// 上界快速拒绝：union ≥ |local| 且 union ≥ |global|，任一达到 limit
 		// 即必然超限，免于遍历全局表（满员高并发热点路径）。

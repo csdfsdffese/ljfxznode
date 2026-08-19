@@ -12,9 +12,9 @@
 * 支持 Vless XTLS、Reality、XHTTP（splithttp）等新特性。
 * 支持单实例对接多节点，无需重复启动。
 * 支持在线 IP 数限制（device_limit）。
-* 跨节点全局 IP 数限制（面板 WebSocket 设备同步 + REST alivelist 轮询兜底）。
+* 跨节点全局 IP 数限制（面板 WebSocket 设备同步 + REST alivelist 轮询兜底；被剔除 IP 冷却占坑，冷却期内任意节点拒绝重连，到期自动解禁）。
 * 支持限制 TCP 连接数。
-* 支持节点级、用户级限速。
+* 支持节点级、用户级限速（上行 / 下行双向生效）。
 * 自动申请 / 自动续签 TLS 证书（HTTP / DNS / 自签）。
 * 支持自定义 DNS、审计路由规则。
 * 配置修改自动热加载。

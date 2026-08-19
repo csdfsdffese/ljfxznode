@@ -410,10 +410,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		outbound.Writer = managedWriter
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
-			// 协议入口路径（VLESS/Trojan/VMess/SS）只对下行限速：outbound.Writer 是
-			// 目标→客户端方向；上行（outbound.Reader）仅统计不限速。与上游 V2bX 一致
-			// （tun/dokodemo 走 getLink 才双向限速），非遗漏。
+			// 双向限速：下行包 outbound.Writer（目标→客户端），上行包
+			// outbound.Reader（客户端→目标）。旧实现只对下行限速、上行仅统计，
+			// 导致配置的上传限速不生效。
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
+			outbound.Reader = rate.NewRateLimitReader(outbound.Reader, w)
 		}
 		t := counter.NewTrafficCounter()
 		if c, ok := d.Counter.LoadOrStore(sessionInbound.Tag, t); ok {
