@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"errors"
+	"maps"
 	"regexp"
 	"strings"
 	"sync"
@@ -194,9 +195,7 @@ func (l *Limiter) GetAliveCount(uid int) int {
 func (l *Limiter) GetAliveList() map[int]int {
 	l.aliveLock.RLock()
 	out := make(map[int]int, len(l.AliveList))
-	for k, v := range l.AliveList {
-		out[k] = v
-	}
+	maps.Copy(out, l.AliveList)
 	l.aliveLock.RUnlock()
 	return out
 }
@@ -253,12 +252,8 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noSSUDP bool) (Bucket *r
 	ip = strings.TrimPrefix(ip, "::ffff:")
 
 	// check and gen speed limit Bucket
-	nodeLimit := l.SpeedLimit
-	if nodeLimit < 0 {
-		// defensive: a negative node speed limit from config must not create
-		// a broken token bucket
-		nodeLimit = 0
-	}
+	// 防御：面板下发负限速值不得产生损坏的令牌桶
+	nodeLimit := max(l.SpeedLimit, 0)
 	userLimit := 0
 	deviceLimit := 0
 	var uid int
@@ -272,9 +267,7 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, noSSUDP bool) (Bucket *r
 	} else {
 		return nil, true
 	}
-	if userLimit < 0 {
-		userLimit = 0
-	}
+	userLimit = max(userLimit, 0)
 	if noSSUDP {
 		// 仅 TCP 连接计数（对齐官方 Xboard-Node：UDP 会话只裁决、不占用设备数）。
 		// 裁决 + 计数原子化（TryOpenConn），避免并发新连接同时通过门禁导致超限；
@@ -505,7 +498,7 @@ func (l *Limiter) checkDeviceGate(uid int, ip string, limit int) (reject bool, v
 		// 上界快速拒绝：union ≥ |local| 且 union ≥ |global|，任一达到 limit
 		// 即必然超限，免于遍历全局表（满员高并发热点路径）。
 		if len(local) >= limit || globalCount >= limit {
-			victim := pickVictim(local, globalIPs)
+			victim = pickVictim(local, globalIPs)
 			sh.mu.RUnlock()
 			return true, victim
 		}
@@ -515,17 +508,14 @@ func (l *Limiter) checkDeviceGate(uid int, ip string, limit int) (reject bool, v
 			sh.mu.RUnlock()
 			return false, ""
 		}
-		// 中间区间：精确计算并集（去重）设备数
+		// 中间区间：精确计算并集（去重）设备数（range nil map 安全）
 		count := len(local)
-		if globalIPs != nil {
-			for gip := range globalIPs {
-				if _, dup := local[gip]; !dup {
-					count++
-				}
+		for gip := range globalIPs {
+			if _, dup := local[gip]; !dup {
+				count++
 			}
 		}
 		// victim 必须在持有 local 读锁时选出（遍历共享 map）
-		var victim string
 		if count >= limit {
 			victim = pickVictim(local, globalIPs)
 		}

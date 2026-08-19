@@ -109,7 +109,8 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
+	// 私钥文件必须 0600：仅属主可读，防止系统其它用户窃取服务器身份密钥。
+	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}

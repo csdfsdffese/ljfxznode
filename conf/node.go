@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"encoding/json"
 
@@ -43,7 +44,9 @@ func (n *NodeConfig) UnmarshalJSON(data []byte) (err error) {
 		// 用前缀判断而非精确相等，否则远程 URL 永远落进 os.Open 分支而失败。
 		file, _ := strings.CutPrefix(rn.Include, ":")
 		if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
-			rsp, err := http.Get(file)
+			// 带超时的 client：远端不可达时 10s 报错退出，避免启动无限卡死。
+			client := &http.Client{Timeout: 10 * time.Second}
+			rsp, err := client.Get(file)
 			if err != nil {
 				return err
 			}

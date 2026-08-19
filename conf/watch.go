@@ -32,6 +32,12 @@ func (p *Conf) Watch(filePath, xDnsPath string, reload func()) error {
 				}
 				pre = time.Now()
 				go func() {
+					// reload 内部（如解析面板下发配置）panic 时不得拖垮整个节点进程
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("Reload panicked, recovered: %v", r)
+						}
+					}()
 					time.Sleep(5 * time.Second)
 					switch filepath.Base(strings.TrimSuffix(e.Name, "~")) {
 					case filepath.Base(xDnsPath):

@@ -80,9 +80,8 @@ func saveDnsConfig(dns []byte, dnsPath string) (err error) {
 			log.WithField("err", err).Error("Failed to understand DNS config, Please check: https://xtls.github.io/config/dns.html for help")
 			return err
 		}
-		if err = os.Truncate(dnsPath, 0); err != nil {
-			log.WithField("err", err).Error("Failed to clear XRAY DNS PATH file")
-		}
+		// os.WriteFile 以 O_TRUNC 打开自带截断，无需先行 Truncate；
+		// 单独 Truncate 若成功而 WriteFile 失败会留下空 DNS 文件（比保留旧内容更糟）。
 		if err = os.WriteFile(dnsPath, dns, 0644); err != nil {
 			log.WithField("err", err).Error("Failed to write DNS to XRAY DNS PATH file")
 		}
