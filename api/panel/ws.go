@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -311,15 +312,16 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 }
 
 // decodeSyncDevices 宽松解析 sync.devices 的 users 载荷。
-// 面板 DeviceStateService 用 array_unique 去重后，同一用户跨节点重复 IP 时
-// JSON 可能输出为对象（{"0":"ip1","2":"ip2"}）而非数组，直接解析
-// map[int][]string 会整体失败。先按强类型解析，失败再走宽松路径。
+// 面板 DeviceStateService::getUsersDevices 用 array_unique 去重后，同一用户
+// 跨节点重复 IP 时 PHP 数组下标不连续，JSON 可能输出为对象
+// （{"0":"ip1","2":"ip2"}）而非数组，直接解析 map[int][]string 会整体失败。
+// 解析顺序：强类型数组 → 宽松对象（按 key 排序还原）→ 单字符串 → 丢弃。
 func decodeSyncDevices(raw json.RawMessage) (map[int][]string, error) {
 	var strict syncDevicesPayload
 	if err := json.Unmarshal(raw, &strict); err == nil && strict.Users != nil {
 		return strict.Users, nil
 	}
-	// 宽松兜底：逐 uid 解析，值可能是 []interface{} 或 string
+	// 宽松兜底：逐 uid 解析，值可能是数组、对象或单字符串
 	var lax struct {
 		Users map[string]json.RawMessage `json:"users"`
 	}
@@ -334,11 +336,28 @@ func decodeSyncDevices(raw json.RawMessage) (map[int][]string, error) {
 		}
 		var ips []string
 		if err := json.Unmarshal(v, &ips); err != nil {
-			var single string
-			if err2 := json.Unmarshal(v, &single); err2 != nil {
-				continue
+			// 对象格式：array_unique 后下标不连续，key 为数字字符串，
+			// 按下标排序保证 IP 列表顺序确定（内容集合等价）。
+			var ipMap map[string]string
+			if err := json.Unmarshal(v, &ipMap); err != nil {
+				var single string
+				if err2 := json.Unmarshal(v, &single); err2 != nil {
+					continue
+				}
+				ips = []string{single}
+			} else {
+				keys := make([]int, 0, len(ipMap))
+				for k := range ipMap {
+					if n, convErr := strconv.Atoi(k); convErr == nil {
+						keys = append(keys, n)
+					}
+				}
+				sort.Ints(keys)
+				ips = make([]string, 0, len(keys))
+				for _, k := range keys {
+					ips = append(ips, ipMap[strconv.Itoa(k)])
+				}
 			}
-			ips = []string{single}
 		}
 		out[uid] = ips
 	}
