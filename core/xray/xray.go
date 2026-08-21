@@ -72,9 +72,17 @@ func parseConnectionConfig(c *conf.XrayConnectionConfig) (policy *coreConf.Polic
 func getCore(c *conf.XrayConfig) *core.Instance {
 	os.Setenv("XRAY_LOCATION_ASSET", c.AssetPath)
 	// Log Config
+	// 对齐官方 DefaultLogConfig（AccessLogType=LogType_None）：未配置 AccessPath
+	// 时不输出 access 日志。否则 coreConf.LogConfig.Build() 会因空串落入 Console
+	// 分支，每个连接一条 access 日志打到 stdout（→ journald），大流量节点会
+	// 持续推高 systemd-journald 的 CPU/内存。要启用请显式配置 AccessPath 文件路径。
+	accessPath := c.LogConfig.AccessPath
+	if accessPath == "" {
+		accessPath = "none"
+	}
 	coreLogConfig := &coreConf.LogConfig{
 		LogLevel:  c.LogConfig.Level,
-		AccessLog: c.LogConfig.AccessPath,
+		AccessLog: accessPath,
 		ErrorLog:  c.LogConfig.ErrorPath,
 	}
 	// DNS config

@@ -193,7 +193,9 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 
 	var limit *limiter.Limiter
 	var err error
-	if user != nil && len(user.Email) > 0 {
+	// 守卫与 routedDispatch/connClosed 严格对齐（Email 非空且 Tag 非空）：
+	// 自定义 inbound（无 tag）即使携带 Email 也走纯转发，不参与限速。
+	if user != nil && len(user.Email) > 0 && sessionInbound.Tag != "" {
 		limit, err = limiter.GetLimiter(sessionInbound.Tag)
 		if err != nil {
 			errors.LogInfo(ctx, "get limiter ", sessionInbound.Tag, " error: ", err)
@@ -376,7 +378,9 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 
 	var limit *limiter.Limiter
 	var err error
-	if user != nil && len(user.Email) > 0 {
+	// 守卫与 routedDispatch/connClosed 严格对齐（Email 非空且 Tag 非空）：
+	// 自定义 inbound（无 tag）即使携带 Email 也走纯转发，不参与限速。
+	if user != nil && len(user.Email) > 0 && sessionInbound.Tag != "" {
 		limit, err = limiter.GetLimiter(sessionInbound.Tag)
 		if err != nil {
 			errors.LogInfo(ctx, "get limiter ", sessionInbound.Tag, " error: ", err)
@@ -533,14 +537,21 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	sessionInbound := session.InboundFromContext(ctx)
 	// 连接级设备计数：连接生命周期结束时递减 refcount（与 CheckLimit 中
 	// ConnOpened 配对）。仅 TCP 连接计数（与 noSSUDP 条件一致），UDP 会话不计数。
-	if sessionInbound != nil && sessionInbound.User != nil && destination.Network == net.Network_TCP {
+	// 守卫与 getLink/DispatchLink 的限速条件严格对齐（Email 非空且 Tag 非空）：
+	// 自定义 inbound（TUN/wireguard/dokodemo 等，无 tag、Email 为空）不参与
+	// 限速，既避免 ConnClosed 无 ConnOpened 配对的 refcount 失衡，也避免
+	// GetLimiter("") 必然 not found 刷错误日志。
+	if sessionInbound != nil && sessionInbound.User != nil &&
+		len(sessionInbound.User.Email) > 0 && len(sessionInbound.Tag) > 0 &&
+		destination.Network == net.Network_TCP {
 		if lim, err := limiter.GetLimiter(sessionInbound.Tag); err == nil {
 			ip := sessionInbound.Source.Address.IP().String()
 			defer lim.ConnClosed(sessionInbound.User.Email, ip)
 		}
 	}
 
-	if sessionInbound != nil && sessionInbound.User != nil {
+	if sessionInbound != nil && sessionInbound.User != nil &&
+		len(sessionInbound.User.Email) > 0 && len(sessionInbound.Tag) > 0 {
 		if l == nil {
 			var err error
 			l, err = limiter.GetLimiter(sessionInbound.Tag)

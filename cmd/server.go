@@ -36,6 +36,12 @@ func init() {
 	command.AddCommand(&serverCommand)
 }
 
+var (
+	// logFile 记录当前 logrus 文件输出句柄；reload 重开日志文件前先关闭旧句柄，
+	// 否则每次 applyLogConfig 都会泄漏一个 fd。
+	logFile *os.File
+)
+
 func applyLogConfig(c *conf.Conf) {
 	switch c.LogConfig.Level {
 	case "debug":
@@ -54,6 +60,10 @@ func applyLogConfig(c *conf.Conf) {
 			// OpenFile 失败时 f 为 nil，继续 SetOutput 会把日志写到 nil writer 造成静默丢失
 			return
 		}
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		logFile = f
 		log.SetOutput(f)
 	}
 }
