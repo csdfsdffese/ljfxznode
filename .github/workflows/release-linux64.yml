@@ -76,8 +76,9 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git tag "${{ github.event.inputs.tag }}"
-          git push origin "${{ github.event.inputs.tag }}"
+          # -f 支持对已存在 tag 重新构建，用于更新对应 Release 的资产（如覆盖修复版）
+          git tag -f "${{ github.event.inputs.tag }}"
+          git push -f origin "${{ github.event.inputs.tag }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
