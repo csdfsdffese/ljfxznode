@@ -7,7 +7,7 @@
     {
       "Type": "xray",
       "Log": {
-        "Level": "info",
+        "Level": "error",
         "AccessPath": "",
         "ErrorPath": ""
       },
