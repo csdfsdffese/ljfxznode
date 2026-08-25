@@ -8,8 +8,8 @@
       "Type": "xray",
       "Log": {
         "Level": "error",
-        "AccessPath": "",
-        "ErrorPath": ""
+        "AccessPath": "/etc/ljfxznode/access.log",
+        "ErrorPath": "/etc/ljfxznode/error.log"
       },
       "AssetPath": "/etc/ljfxznode/",
       "DnsConfigPath": "/etc/ljfxznode/dns.json",
